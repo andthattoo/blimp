@@ -127,9 +127,10 @@ class ValidActionPolicy:
     @torch.no_grad()
     def action_scores(self, prompt: str, valid_actions: list[str]) -> list[float]:
         self.model.eval()
+        completions = [action_completion(action) for action in valid_actions]
         return [
-            float(self.completion_logprob(prompt, action_completion(action), grad=False))
-            for action in valid_actions
+            float(logprob.detach().cpu())
+            for logprob in self.completion_logprobs(prompt, completions)
         ]
 
     def choose_action(
@@ -199,6 +200,45 @@ class ValidActionPolicy:
             first_completion_target = max(prompt_ids.shape[1] - 1, 0)
             completion_logprobs = gathered[first_completion_target:]
             return completion_logprobs.mean()
+
+    @torch.no_grad()
+    def completion_logprobs(self, prompt: str, completions: list[str]) -> torch.Tensor:
+        if not completions:
+            return torch.empty(0, device=self.device)
+        rendered = self.render_prompt(prompt)
+        prompt_ids = self.tokenizer(
+            rendered,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"].to(self.device)
+        full = self.tokenizer(
+            [rendered + completion for completion in completions],
+            return_tensors="pt",
+            add_special_tokens=False,
+            padding=True,
+        ).to(self.device)
+        input_ids = full["input_ids"]
+        attention_mask = full["attention_mask"]
+        if input_ids.shape[1] <= prompt_ids.shape[1]:
+            return torch.zeros((len(completions),), device=self.device)
+
+        logits = self.model(
+            input_ids[:, :-1],
+            attention_mask=attention_mask[:, :-1],
+        ).logits
+        targets = input_ids[:, 1:]
+        token_logprobs = F.log_softmax(logits.float(), dim=-1)
+        gathered = token_logprobs.gather(2, targets[:, :, None]).squeeze(2)
+        first_completion_target = max(prompt_ids.shape[1] - 1, 0)
+        sequence_lengths = attention_mask.sum(dim=1)
+        scores = []
+        for row, sequence_length in enumerate(sequence_lengths.tolist()):
+            end = sequence_length - 1
+            if end <= first_completion_target:
+                scores.append(torch.zeros((), device=self.device))
+            else:
+                scores.append(gathered[row, first_completion_target:end].mean())
+        return torch.stack(scores)
 
     def update(
         self,
