@@ -104,6 +104,13 @@ MODEL=Qwen/Qwen3-1.7B OUT=runs/sglang-hard-qwen3-17b-smoke \
   scripts/run_sglang_hard_smoke.sh
 ```
 
+Or start the server and run the same smoke in one process:
+
+```bash
+MODEL=Qwen/Qwen3-1.7B OUT=runs/sglang-hard-qwen3-17b-smoke \
+  scripts/run_sglang_server_hard_smoke.sh
+```
+
 For a CPU-only wiring smoke without SGLang:
 
 ```bash
