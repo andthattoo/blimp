@@ -47,6 +47,7 @@ class SGLangConfig:
     temperature: float = 0.3
     max_tokens: int = 128
     memory_max_tokens: int = 256
+    disable_thinking: bool = True
     timeout: float = 120.0
 
 
@@ -121,6 +122,9 @@ class SGLangAgent:
             "temperature": self.config.temperature,
             "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
         }
+        if self.config.disable_thinking:
+            payload["reasoning_effort"] = "none"
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             self.url,
@@ -320,6 +324,7 @@ Markdown note for next self:
 
 
 def parse_agent_response(text: str) -> AgentResponse:
+    text = strip_reasoning(text)
     action = ""
     action_match = re.search(r"(?im)^\s*ACTION\s*:\s*(.+)$", text)
     if action_match:
@@ -330,6 +335,12 @@ def parse_agent_response(text: str) -> AgentResponse:
         action = action.removeprefix("-").strip()
 
     return AgentResponse(action=action, raw_text=text.strip())
+
+
+def strip_reasoning(text: str) -> str:
+    text = re.sub(r"(?is)<think>.*?</think>", "", text)
+    text = re.sub(r"(?is)<think>.*$", "", text)
+    return text.strip()
 
 
 def run_standard(
@@ -529,12 +540,14 @@ def run_blimp_tree(
                         valid_actions=valid_actions,
                         branch_hint=_branch_hint(branch_index),
                     )
-                    memory_response = agent.generate_memory_note(
-                        memory=memory,
-                        history=history,
-                        observation=observation,
-                        valid_actions=valid_actions,
-                        branch_hint=_branch_hint(branch_index),
+                    memory_response = strip_reasoning(
+                        agent.generate_memory_note(
+                            memory=memory,
+                            history=history,
+                            observation=observation,
+                            valid_actions=valid_actions,
+                            branch_hint=_branch_hint(branch_index),
+                        )
                     ).strip()
                     total_calls += 1
                     if memory_response:
@@ -660,6 +673,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--memory-max-tokens", type=int, default=256)
+    parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--no-stop-on-solved-depth", action="store_true")
     parser.add_argument("--out", default="runs/sglang-latest")
@@ -675,6 +689,7 @@ def main() -> None:
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
                 memory_max_tokens=args.memory_max_tokens,
+                disable_thinking=not args.enable_thinking,
                 timeout=args.timeout,
             )
         )

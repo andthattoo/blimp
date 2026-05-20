@@ -85,7 +85,9 @@ Write anything that would help your next self continue from scratch.
 ```
 
 The resulting free-form Markdown note is copied only to child continuations of
-that branch, not to sibling branches.
+that branch, not to sibling branches. Qwen3 thinking is disabled by default for
+these action/note calls so the token budget is spent on the required action or
+state note rather than hidden deliberation.
 
 Start an SGLang server:
 
