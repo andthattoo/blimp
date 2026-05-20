@@ -437,7 +437,9 @@ def _run_block(
     memory_current = truncate_memory(memory_used, memory_words)
     steps: list[StepTrace] = []
     actions: list[str] = []
-    history = [f"ACTION: {action}" for action in path_actions_before[-12:]]
+    # Block boundaries are the context boundary. Prior trajectory information
+    # must flow through memory, not through a hidden action-history side channel.
+    history: list[str] = []
     done = False
     score = 0.0
 
