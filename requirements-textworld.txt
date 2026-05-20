@@ -1,0 +1,2 @@
+-r requirements-train.txt
+textworld>=1.6

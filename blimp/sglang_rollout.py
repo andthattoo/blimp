@@ -239,9 +239,15 @@ def build_action_prompt(
     history: list[str],
     branch_hint: str,
     memory_enabled: bool,
+    history_limit: int | None = 16,
 ) -> str:
     actions = "\n".join(f"- {action}" for action in valid_actions) or "- look"
-    transcript = "\n".join(history[-16:]) if history else "None."
+    if not history:
+        transcript = "None."
+    elif history_limit is None or history_limit <= 0:
+        transcript = "\n".join(history)
+    else:
+        transcript = "\n".join(history[-history_limit:])
     if memory_enabled:
         memory_text = memory.strip() or "empty"
         return f"""You are controlling a text-environment agent.

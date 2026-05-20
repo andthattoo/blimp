@@ -472,7 +472,11 @@ class TextWorldEnv:
             description=True,
             inventory=True,
             location=True,
+            objective=True,
             score=True,
+            max_score=True,
+            won=True,
+            lost=True,
         )
         self._env = textworld.start(self.game_file, infos=infos)
         self._state = self._env.reset()
@@ -486,27 +490,44 @@ class TextWorldEnv:
     def step(self, action: str) -> StepResult:
         if self._env is None:
             raise RuntimeError("TextWorld environment must be reset before stepping.")
-        self._state, score, done = self._env.step(action)
+        self._state, reward, done = self._env.step(action)
+        score = float(getattr(self._state, "score", reward) or reward)
         return StepResult(
             observation=self._feedback(self._state),
-            reward=float(score),
+            reward=float(reward),
             done=bool(done),
             info={
-                "score": float(getattr(self._state, "score", score) or score),
+                "score": score,
+                "max_score": float(getattr(self._state, "max_score", 0.0) or 0.0),
                 "valid": action in self.valid_actions(),
                 "admissible_commands": self.valid_actions(),
+                "won": bool(getattr(self._state, "won", False)),
+                "lost": bool(getattr(self._state, "lost", False)),
             },
         )
 
     @staticmethod
     def _feedback(state: Any) -> str:
+        parts = []
+        objective = getattr(state, "objective", None)
+        if objective:
+            parts.append(f"Objective: {objective}")
         feedback = getattr(state, "feedback", None)
         if feedback:
-            return str(feedback)
-        parts = [
-            getattr(state, "description", ""),
-            getattr(state, "inventory", ""),
-        ]
+            parts.append(f"Feedback: {feedback}")
+        description = getattr(state, "description", None)
+        if description:
+            parts.append(f"Room: {description}")
+        inventory = getattr(state, "inventory", None)
+        if inventory:
+            parts.append(f"Inventory: {inventory}")
+        score = getattr(state, "score", None)
+        max_score = getattr(state, "max_score", None)
+        if score is not None:
+            if max_score is not None:
+                parts.append(f"Score: {score}/{max_score}")
+            else:
+                parts.append(f"Score: {score}")
         return "\n".join(str(part) for part in parts if part).strip()
 
 

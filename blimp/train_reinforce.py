@@ -28,6 +28,7 @@ class Transition:
 class EpisodeTrace:
     episode_id: int
     mode: str
+    game_file: str | None
     solved: bool
     score: float
     total_reward: float
@@ -269,6 +270,7 @@ def run_episode(
     block_len: int,
     memory_words: int,
     memory_max_tokens: int,
+    history_limit: int | None,
     temperature: float,
     epsilon: float,
     greedy: bool,
@@ -297,6 +299,7 @@ def run_episode(
             history=history,
             branch_hint="Training rollout: choose the action most likely to complete the task.",
             memory_enabled=memory_enabled,
+            history_limit=history_limit,
         )
         action, _ = policy.choose_action(
             prompt,
@@ -347,6 +350,7 @@ def run_episode(
     return EpisodeTrace(
         episode_id=episode_id,
         mode=mode,
+        game_file=game_file,
         solved=solved,
         score=score,
         total_reward=total_reward,
@@ -388,6 +392,40 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
+def find_game_files(game_file: str | None, game_dir: str | None) -> list[str]:
+    if game_file:
+        return [game_file]
+    if not game_dir:
+        return []
+    root = Path(game_dir)
+    suffixes = {".ulx", ".z8"}
+    return sorted(str(path) for path in root.rglob("*") if path.suffix.lower() in suffixes)
+
+
+def select_game_file(game_files: list[str], index: int) -> str | None:
+    if not game_files:
+        return None
+    return game_files[index % len(game_files)]
+
+
+def maybe_init_wandb(args: argparse.Namespace, config: dict[str, Any]) -> Any:
+    if not args.wandb_project:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError(
+            "wandb logging requested but wandb is not installed. "
+            "Install `wandb` or omit --wandb-project."
+        ) from exc
+
+    return wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        config=config,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Online REINFORCE over valid text-environment actions."
@@ -395,6 +433,9 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--env", choices=["tiny", "hard", "textworld"], default="hard")
     parser.add_argument("--game-file", default=None)
+    parser.add_argument("--game-dir", default=None)
+    parser.add_argument("--eval-game-file", default=None)
+    parser.add_argument("--eval-game-dir", default=None)
     parser.add_argument("--mode", choices=["standard", "blimp"], default="blimp")
     parser.add_argument("--updates", type=int, default=20)
     parser.add_argument("--episodes-per-update", type=int, default=2)
@@ -404,6 +445,12 @@ def main() -> None:
     parser.add_argument("--block-len", type=int, default=5)
     parser.add_argument("--memory-words", type=int, default=240)
     parser.add_argument("--memory-max-tokens", type=int, default=160)
+    parser.add_argument(
+        "--history-limit",
+        type=int,
+        default=16,
+        help="Number of recent observation/action pairs in the action prompt. Use 0 for all.",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--epsilon", type=float, default=0.15)
     parser.add_argument("--gamma", type=float, default=0.97)
@@ -415,14 +462,27 @@ def main() -> None:
     parser.add_argument("--no-normalize-advantages", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--out", default="runs/reinforce-latest")
     args = parser.parse_args()
 
+    train_game_files = find_game_files(args.game_file, args.game_dir)
+    eval_game_files = find_game_files(args.eval_game_file, args.eval_game_dir) or train_game_files
+    if args.env == "textworld" and not train_game_files:
+        raise ValueError("TextWorld training requires --game-file or --game-dir")
+    if args.env == "textworld" and not eval_game_files:
+        raise ValueError("TextWorld evaluation requires --eval-game-file/--eval-game-dir or train games")
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    config = vars(args).copy()
+    config["train_game_files"] = train_game_files
+    config["eval_game_files"] = eval_game_files
     with (out_dir / "config.json").open("w", encoding="utf-8") as handle:
-        json.dump(vars(args), handle, indent=2)
+        json.dump(config, handle, indent=2)
         handle.write("\n")
+    wandb_run = maybe_init_wandb(args, config)
 
     rng = random.Random(args.seed)
     policy = ValidActionPolicy(
@@ -444,13 +504,17 @@ def main() -> None:
                     policy=policy,
                     episode_id=10_000 + update * 100 + i,
                     env_name=args.env,
-                    game_file=args.game_file,
+                    game_file=select_game_file(
+                        eval_game_files,
+                        update * max(args.eval_episodes, 1) + i,
+                    ),
                     seed=args.seed,
                     mode=args.mode,
                     max_steps=args.max_steps,
                     block_len=args.block_len,
                     memory_words=args.memory_words,
                     memory_max_tokens=args.memory_max_tokens,
+                    history_limit=args.history_limit,
                     temperature=1.0,
                     epsilon=0.0,
                     greedy=True,
@@ -470,6 +534,8 @@ def main() -> None:
                 out_dir / "eval_traces.jsonl",
                 [trace.json_dict() for trace in eval_traces],
             )
+            if wandb_run is not None:
+                wandb_run.log(row, step=update)
             print(json.dumps(row), flush=True)
 
         if update == args.updates:
@@ -480,13 +546,14 @@ def main() -> None:
                 policy=policy,
                 episode_id=global_episode + i,
                 env_name=args.env,
-                game_file=args.game_file,
+                game_file=select_game_file(train_game_files, global_episode + i),
                 seed=args.seed,
                 mode=args.mode,
                 max_steps=args.max_steps,
                 block_len=args.block_len,
                 memory_words=args.memory_words,
                 memory_max_tokens=args.memory_max_tokens,
+                history_limit=args.history_limit,
                 temperature=args.temperature,
                 epsilon=args.epsilon,
                 greedy=False,
@@ -513,6 +580,8 @@ def main() -> None:
             out_dir / "train_traces.jsonl",
             [trace.json_dict() for trace in train_traces],
         )
+        if wandb_run is not None:
+            wandb_run.log(row, step=update + 1)
         print(json.dumps(row), flush=True)
 
     policy.save(out_dir / "adapter")
@@ -522,6 +591,8 @@ def main() -> None:
     with (out_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary_rows[-10:], handle, indent=2)
         handle.write("\n")
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
