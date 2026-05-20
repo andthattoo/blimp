@@ -168,7 +168,10 @@ def build_prompt(
     recent = "\n".join(history[-8:]) if history else "None."
     memory_text = memory.strip() or "None yet."
     return f"""You are an agent in a text environment.
+Complete the environment objective as directly as possible.
 Choose exactly one valid action and update compact memory for future short blocks.
+If a goal-relevant item is visible and a matching take action is valid, take it.
+Do not invent rooms, objects, exits, or actions that are not in the observation.
 
 Output exactly:
 ACTION: <one valid action>

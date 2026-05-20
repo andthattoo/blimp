@@ -178,7 +178,10 @@ class TinyQuestEnv:
         door = ""
         if self.location == "hall":
             door = " The north door is unlocked." if self.door_unlocked else " The north door is locked."
-        return f"{message}\n{room['desc']}{door}{item_text}{inventory}"
+        return (
+            "Goal: recover the blue gem.\n"
+            f"{message}\n{room['desc']}{door}{item_text}{inventory}"
+        )
 
 
 class TextWorldEnv:
