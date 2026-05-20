@@ -493,6 +493,7 @@ class TextWorldEnv:
     def step(self, action: str) -> StepResult:
         if self._env is None:
             raise RuntimeError("TextWorld environment must be reset before stepping.")
+        was_valid = action in self.valid_actions()
         self._state, reward, done = self._env.step(action)
         score = float(getattr(self._state, "score", reward) or reward)
         return StepResult(
@@ -502,7 +503,7 @@ class TextWorldEnv:
             info={
                 "score": score,
                 "max_score": float(getattr(self._state, "max_score", 0.0) or 0.0),
-                "valid": action in self.valid_actions(),
+                "valid": was_valid,
                 "admissible_commands": self.valid_actions(),
                 "won": bool(getattr(self._state, "won", False)),
                 "lost": bool(getattr(self._state, "lost", False)),
