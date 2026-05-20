@@ -1,0 +1,8 @@
+accelerate>=0.33
+matplotlib>=3.8
+sentencepiece>=0.2
+transformers>=4.44
+
+# Install only when running real TextWorld games. Some Python/C compiler stacks
+# make TextWorld slower to install, so keep it explicit for Jarvis runs.
+# textworld>=1.6

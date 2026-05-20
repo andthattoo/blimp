@@ -1,0 +1,23 @@
+[project]
+name = "blimp"
+version = "0.1.0"
+description = "Branch-Local Memory Planning experiments for short-context, long-horizon RL."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+hf = [
+  "accelerate>=0.33",
+  "sentencepiece>=0.2",
+  "transformers>=4.44",
+]
+plot = [
+  "matplotlib>=3.8",
+]
+textworld = [
+  "textworld>=1.6",
+]
+
+[tool.setuptools.packages.find]
+include = ["blimp*"]
