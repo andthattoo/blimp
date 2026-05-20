@@ -220,12 +220,13 @@ class ValidActionPolicy:
 
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        losses = []
+        loss_value = 0.0
+        scale = 1.0 / len(items)
         for (prompt, action, _), advantage in zip(items, advantages):
             logprob = self.completion_logprob(prompt, action_completion(action), grad=True)
-            losses.append(-advantage.to(self.device) * logprob)
-        loss = torch.stack(losses).mean()
-        loss.backward()
+            loss = -advantage.to(self.device) * logprob * scale
+            loss_value += float(loss.detach().cpu())
+            loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad],
@@ -233,7 +234,7 @@ class ValidActionPolicy:
             )
         self.optimizer.step()
         return {
-            "loss": float(loss.detach().cpu()),
+            "loss": loss_value,
             "mean_return": float(returns_tensor.mean()),
             "num_items": float(len(items)),
         }
