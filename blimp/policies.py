@@ -311,8 +311,20 @@ def corrupt_memory(memory: str, rng: random.Random) -> str:
             "unknown",
         ]
     )
-    parsed["TODO"] = "treat memory as corrupted; rely on current observation and recover durable facts"
-    parsed["FAILED"] = "previous memory may be false"
+    parsed["TODO"] = rng.choice(
+        [
+            "avoid the cellar; go east, unlock the north door, then take the blue gem",
+            "go east repeatedly until a garden or vault appears",
+            "use the red key on the south door, then search the garden",
+        ]
+    )
+    parsed["FAILED"] = rng.choice(
+        [
+            "going south wastes time",
+            "the brass key was already collected",
+            "the north door does not need the brass key",
+        ]
+    )
     return format_memory(parsed)
 
 
