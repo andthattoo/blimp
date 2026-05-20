@@ -343,10 +343,7 @@ def _run_branching(
                     rng=rng,
                     memory_enabled=True,
                     memory_words=memory_words,
-                    branch_hint=(
-                        f"Branch {branch_index}: try a distinct plausible continuation "
-                        "from the current memory state."
-                    ),
+                    branch_hint=_branch_hint(branch_index),
                 )
                 blocks.append(block)
                 total_actions += len(block.actions)
@@ -512,6 +509,23 @@ def _assign_terminal_rewards(blocks: list[BlockTrace], winning_block_id: str | N
         block = by_id[current]
         block.terminal_reward = 1.0
         current = block.parent_block_id
+
+
+def _branch_hint(branch_index: int) -> str:
+    if branch_index == 0:
+        return (
+            "Branch 0: take the earliest plausible progress action from valid actions; "
+            "prefer movement, taking visible goal-relevant items, or unlocking over look."
+        )
+    if branch_index == 1:
+        return (
+            "Branch 1: deliberately choose a different plausible route than branch 0; "
+            "prefer the later movement or item action in valid actions when it can reveal new state."
+        )
+    return (
+        f"Branch {branch_index}: try a distinct plausible continuation that avoids "
+        "repeating earlier branch choices."
+    )
 
 
 def write_jsonl(path: Path, rows: list[RunResult]) -> None:

@@ -18,6 +18,17 @@ MEMORY_FIELDS = [
     "FAILED",
 ]
 
+PROMPT_BOUNDARY_FIELDS = {
+    "ACTION",
+    "OBSERVATION",
+    "VALID ACTIONS",
+    "MEMORY_PATCH",
+    "BRANCH HINT",
+    "CURRENT MEMORY",
+    "RECENT ACTIONS",
+    "OUTPUT EXACTLY",
+}
+
 DEFAULT_MEMORY = {
     "GOAL": "recover the blue gem",
     "LOCATION": "unknown",
@@ -240,7 +251,10 @@ def parse_action_memory(text: str) -> tuple[str, str]:
     memory_match = re.search(r"(?ims)^\s*MEMORY(?:_PATCH)?\s*:\s*(.+)$", text)
     if memory_match:
         memory = memory_match.group(1).strip()
-        memory = re.split(r"(?im)^\s*(ACTION|OBSERVATION|VALID ACTIONS)\s*:", memory)[0]
+        memory = re.split(
+            r"(?im)^\s*(ACTION|OBSERVATION|VALID ACTIONS|BRANCH HINT|CURRENT MEMORY|RECENT ACTIONS|OUTPUT EXACTLY)\s*:",
+            memory,
+        )[0]
         memory = memory.strip()
 
     return action, memory
@@ -347,6 +361,8 @@ def parse_memory(memory: str) -> dict[str, str]:
                 parsed[current_field] = clean_memory_value(" ".join(current_lines))
             current_field = match.group(1).upper()
             current_lines = [match.group(2).strip()]
+        elif _is_prompt_boundary(line):
+            break
         elif current_field is not None:
             current_lines.append(line)
 
@@ -394,6 +410,8 @@ def parse_memory_patch_fields(patch: str) -> dict[str, str]:
                 parsed[current_field] = clean_memory_value(" ".join(current_lines))
             current_field = match.group(1).upper()
             current_lines = [match.group(2).strip()]
+        elif _is_prompt_boundary(line):
+            break
         elif current_field is not None:
             current_lines.append(line)
     if current_field is not None:
@@ -412,8 +430,19 @@ def merge_fact(existing: str, fact: str) -> str:
 
 def clean_memory_value(value: str) -> str:
     value = " ".join(value.split())
-    value = re.sub(r"(?i)\b(ACTION|OBSERVATION|VALID ACTIONS|MEMORY_PATCH)\s*:.*$", "", value)
+    value = re.sub(
+        r"(?i)\b(ACTION|OBSERVATION|VALID ACTIONS|MEMORY_PATCH|BRANCH HINT|CURRENT MEMORY|RECENT ACTIONS|OUTPUT EXACTLY)\s*:.*$",
+        "",
+        value,
+    )
     return value.strip(" -") or "unknown"
+
+
+def _is_prompt_boundary(line: str) -> bool:
+    match = re.match(r"^([A-Za-z_ ]+)\s*:", line)
+    if not match:
+        return False
+    return match.group(1).replace("_", " ").upper() in PROMPT_BOUNDARY_FIELDS
 
 
 def make_policy(
