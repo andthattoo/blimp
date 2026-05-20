@@ -72,6 +72,49 @@ pip install -r requirements-gpu.txt
 MODEL=Qwen/Qwen2.5-1.5B-Instruct OUT=runs/hf-tiny scripts/run_hf_tiny.sh
 ```
 
+## SGLang BLiMP Rollouts
+
+The SGLang runner uses branch-local "dead man's notes." In `standard` mode the
+model gets the full trajectory transcript and no external memory. In `blimp`
+mode the model expands 5-step blocks in a tree. At the end of each unfinished
+block, it gets a user-style memory-boundary prompt:
+
+```text
+You are about to lose the transcript.
+Write anything that would help your next self continue from scratch.
+```
+
+The resulting free-form Markdown note is copied only to child continuations of
+that branch, not to sibling branches.
+
+Start an SGLang server:
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-1.7B \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --context-length 32768
+```
+
+Run the hard local task through the SGLang server:
+
+```bash
+MODEL=Qwen/Qwen3-1.7B OUT=runs/sglang-hard-qwen3-17b-smoke \
+  scripts/run_sglang_hard_smoke.sh
+```
+
+For a CPU-only wiring smoke without SGLang:
+
+```bash
+python -m blimp.sglang_rollout \
+  --mock-policy scripted-hard \
+  --env hard \
+  --episodes 1 \
+  --modes standard,blimp \
+  --out runs/sglang-mock-hard-smoke
+```
+
 For real TextWorld games, install TextWorld and pass either `--game-file` or `--game-dir`:
 
 ```bash
