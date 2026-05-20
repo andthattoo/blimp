@@ -478,7 +478,10 @@ class TextWorldEnv:
             won=True,
             lost=True,
         )
-        self._env = textworld.start(self.game_file, infos=infos)
+        try:
+            self._env = textworld.start(self.game_file, request_infos=infos)
+        except TypeError:
+            self._env = textworld.start(self.game_file, infos=infos)
         self._state = self._env.reset()
         return self._feedback(self._state)
 
