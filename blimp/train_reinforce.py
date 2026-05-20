@@ -90,6 +90,14 @@ class ValidActionPolicy:
             )
             self.model = get_peft_model(self.model, config)
             self.model.print_trainable_parameters()
+        else:
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in self.model.parameters())
+            print(
+                f"trainable params: {trainable:,} || all params: {total:,} "
+                f"|| trainable%: {100 * trainable / total:.4f}",
+                flush=True,
+            )
 
         self.optimizer = torch.optim.AdamW(
             (p for p in self.model.parameters() if p.requires_grad),
