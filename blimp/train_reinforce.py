@@ -54,6 +54,7 @@ class ValidActionPolicy:
         device: str,
         seed: int,
         score_batch_size: int,
+        gradient_checkpointing: bool,
     ) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -70,6 +71,9 @@ class ValidActionPolicy:
             trust_remote_code=True,
         ).to(self.device)
         self.model.config.use_cache = False
+        if gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+            print("gradient checkpointing: enabled", flush=True)
 
         self.uses_lora = lora_rank > 0
         if self.uses_lora:
@@ -201,11 +205,12 @@ class ValidActionPolicy:
         with context:
             logits = self.model(full_ids[:, :-1]).logits[0]
             targets = full_ids[0, 1:]
-            token_logprobs = F.log_softmax(logits.float(), dim=-1)
-            gathered = token_logprobs.gather(1, targets[:, None]).squeeze(1)
             first_completion_target = max(prompt_ids.shape[1] - 1, 0)
-            completion_logprobs = gathered[first_completion_target:]
-            return completion_logprobs.mean()
+            completion_logits = logits[first_completion_target:].float()
+            completion_targets = targets[first_completion_target:]
+            token_logprobs = F.log_softmax(completion_logits, dim=-1)
+            gathered = token_logprobs.gather(1, completion_targets[:, None]).squeeze(1)
+            return gathered.mean()
 
     @torch.no_grad()
     def completion_logprobs(self, prompt: str, completions: list[str]) -> torch.Tensor:
@@ -494,6 +499,7 @@ def main() -> None:
     parser.add_argument("--memory-words", type=int, default=240)
     parser.add_argument("--memory-max-tokens", type=int, default=160)
     parser.add_argument("--score-batch-size", type=int, default=4)
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument(
         "--history-limit",
         type=int,
@@ -543,6 +549,7 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
         score_batch_size=args.score_batch_size,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
 
     started = time.time()

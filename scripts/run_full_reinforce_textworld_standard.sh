@@ -16,8 +16,14 @@ EPSILON=${EPSILON:-0.2}
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
 HISTORY_LIMIT=${HISTORY_LIMIT:-0}
 SCORE_BATCH_SIZE=${SCORE_BATCH_SIZE:-4}
+GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-1}
 WANDB_PROJECT=${WANDB_PROJECT:-}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-full-textworld-standard-qwen3-17b}
+
+TRAINING_ARGS=()
+if [[ "${GRADIENT_CHECKPOINTING}" != "0" ]]; then
+  TRAINING_ARGS+=(--gradient-checkpointing)
+fi
 
 WANDB_ARGS=()
 if [[ -n "${WANDB_PROJECT}" ]]; then
@@ -41,6 +47,7 @@ fi
   --max-steps "${MAX_STEPS}" \
   --history-limit "${HISTORY_LIMIT}" \
   --score-batch-size "${SCORE_BATCH_SIZE}" \
+  "${TRAINING_ARGS[@]}" \
   --temperature "${TEMPERATURE}" \
   --epsilon "${EPSILON}" \
   --learning-rate "${LEARNING_RATE}" \
