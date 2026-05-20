@@ -53,10 +53,12 @@ class ValidActionPolicy:
         learning_rate: float,
         device: str,
         seed: int,
+        score_batch_size: int,
     ) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.device = torch.device(device)
+        self.score_batch_size = max(1, score_batch_size)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -128,10 +130,14 @@ class ValidActionPolicy:
     def action_scores(self, prompt: str, valid_actions: list[str]) -> list[float]:
         self.model.eval()
         completions = [action_completion(action) for action in valid_actions]
-        return [
-            float(logprob.detach().cpu())
-            for logprob in self.completion_logprobs(prompt, completions)
-        ]
+        scores = []
+        for start in range(0, len(completions), self.score_batch_size):
+            batch = completions[start : start + self.score_batch_size]
+            scores.extend(
+                float(logprob.detach().cpu())
+                for logprob in self.completion_logprobs(prompt, batch)
+            )
+        return scores
 
     def choose_action(
         self,
@@ -227,8 +233,6 @@ class ValidActionPolicy:
             attention_mask=attention_mask[:, :-1],
         ).logits
         targets = input_ids[:, 1:]
-        token_logprobs = F.log_softmax(logits.float(), dim=-1)
-        gathered = token_logprobs.gather(2, targets[:, :, None]).squeeze(2)
         first_completion_target = max(prompt_ids.shape[1] - 1, 0)
         sequence_lengths = attention_mask.sum(dim=1)
         scores = []
@@ -237,7 +241,11 @@ class ValidActionPolicy:
             if end <= first_completion_target:
                 scores.append(torch.zeros((), device=self.device))
             else:
-                scores.append(gathered[row, first_completion_target:end].mean())
+                row_logits = logits[row, first_completion_target:end].float()
+                row_targets = targets[row, first_completion_target:end]
+                token_logprobs = F.log_softmax(row_logits, dim=-1)
+                gathered = token_logprobs.gather(1, row_targets[:, None]).squeeze(1)
+                scores.append(gathered.mean())
         return torch.stack(scores)
 
     def update(
@@ -485,6 +493,7 @@ def main() -> None:
     parser.add_argument("--block-len", type=int, default=5)
     parser.add_argument("--memory-words", type=int, default=240)
     parser.add_argument("--memory-max-tokens", type=int, default=160)
+    parser.add_argument("--score-batch-size", type=int, default=4)
     parser.add_argument(
         "--history-limit",
         type=int,
@@ -533,6 +542,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         device=args.device,
         seed=args.seed,
+        score_batch_size=args.score_batch_size,
     )
 
     started = time.time()
