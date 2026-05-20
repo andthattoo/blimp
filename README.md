@@ -124,6 +124,28 @@ python -m blimp.sglang_rollout \
   --out runs/sglang-mock-hard-smoke
 ```
 
+## First Training Loop
+
+The initial training script is an online REINFORCE loop over the environment's
+valid actions with a LoRA adapter. It uses reward from the environment rather
+than oracle traces. In `blimp` mode, the model still writes a free-form
+dead-man note at each block boundary; the policy-gradient update is applied to
+the selected actions.
+
+```bash
+pip install -e .
+pip install -r requirements-train.txt
+
+python -m blimp.train_reinforce \
+  --model Qwen/Qwen3-1.7B \
+  --env hard \
+  --mode blimp \
+  --updates 20 \
+  --episodes-per-update 2 \
+  --eval-every 5 \
+  --out runs/reinforce-hard-qwen3-17b
+```
+
 For real TextWorld games, install TextWorld and pass either `--game-file` or `--game-dir`:
 
 ```bash
