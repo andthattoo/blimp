@@ -324,9 +324,9 @@ class HardQuestEnv:
         elif normalized == "inventory":
             message = "Inventory: " + (", ".join(self.inventory) if self.inventory else "empty") + "."
         elif normalized == "read brass plaque":
+            reward = 0.05 if not self.plaque_read else -0.01
             self.plaque_read = True
             message = "The brass plaque says: passphrase EMBER opens the final vault."
-            reward = 0.05
         elif normalized == "light storm lantern":
             if "storm lantern" not in self.inventory:
                 message = "You need the storm lantern first."
