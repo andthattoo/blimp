@@ -184,6 +184,266 @@ class TinyQuestEnv:
         )
 
 
+class HardQuestEnv:
+    """Longer deterministic quest with durable clue and key dependencies.
+
+    The optimal route crosses several five-step block boundaries. The agent
+    must remember the passphrase learned in the archive, carry two tools, and
+    avoid treating local observations as the whole state.
+    """
+
+    PASS_OPTIONS = ["ember", "mirror", "tide", "brass"]
+
+    def __init__(self) -> None:
+        self.rooms = {
+            "atrium": {
+                "desc": "You are in the atrium. Exits lead north, east, and west.",
+                "exits": {"north": "archive", "east": "gallery", "west": "pantry"},
+            },
+            "archive": {
+                "desc": (
+                    "You are in the archive. A brass plaque is fixed to the wall."
+                ),
+                "exits": {"south": "atrium"},
+            },
+            "pantry": {
+                "desc": "You are in the pantry. A storm lantern hangs from a peg.",
+                "exits": {"east": "atrium"},
+            },
+            "gallery": {
+                "desc": (
+                    "You are in the gallery. Corridors lead west and south. "
+                    "An iron gate blocks the east passage."
+                ),
+                "exits": {"west": "atrium", "south": "armory", "east": "crypt"},
+            },
+            "armory": {
+                "desc": "You are in the armory. An iron key lies in an open drawer.",
+                "exits": {"north": "gallery"},
+            },
+            "crypt": {
+                "desc": (
+                    "You are in the crypt beyond the iron gate. The altar is hard "
+                    "to inspect without a lit lantern."
+                ),
+                "exits": {"west": "gallery", "north": "observatory", "east": "vault_ante"},
+            },
+            "observatory": {
+                "desc": (
+                    "You are in the observatory. A star map says the final vault "
+                    "lies east of the crypt."
+                ),
+                "exits": {"south": "crypt"},
+            },
+            "vault_ante": {
+                "desc": "You stand in the vault antechamber. A moon lock guards the east door.",
+                "exits": {"west": "crypt", "east": "vault"},
+            },
+            "vault": {
+                "desc": (
+                    "You are in the final vault. A speaking lock protects a glass case."
+                ),
+                "exits": {"west": "vault_ante"},
+            },
+        }
+        self.reset()
+
+    def reset(self, seed: int | None = None) -> str:
+        del seed
+        self.location = "atrium"
+        self.inventory: list[str] = []
+        self.iron_gate_unlocked = False
+        self.lantern_lit = False
+        self.vault_unlocked = False
+        self.passphrase_spoken = False
+        self.plaque_read = False
+        self.done = False
+        self.steps = 0
+        self.score = 0.0
+        self._room_items = {
+            "pantry": ["storm lantern"],
+            "armory": ["iron key"],
+            "crypt": ["moon key"],
+            "vault": ["amber seal"],
+        }
+        return self._observation("New episode.")
+
+    def valid_actions(self) -> list[str]:
+        if self.done:
+            return []
+
+        actions = ["look", "inventory"]
+        for direction in self.rooms[self.location]["exits"]:
+            if self.location == "gallery" and direction == "east" and not self.iron_gate_unlocked:
+                actions.append("unlock iron gate")
+            elif self.location == "vault_ante" and direction == "east" and not self.vault_unlocked:
+                actions.append("inspect moon lock")
+            else:
+                actions.append(f"go {direction}")
+
+        if self.location == "archive":
+            actions.append("read brass plaque")
+        if (
+            self.location == "gallery"
+            and "iron key" in self.inventory
+            and not self.iron_gate_unlocked
+        ):
+            actions.append("unlock iron gate with iron key")
+        if "storm lantern" in self.inventory and not self.lantern_lit:
+            actions.append("light storm lantern")
+        if (
+            self.location == "vault_ante"
+            and "moon key" in self.inventory
+            and not self.vault_unlocked
+        ):
+            actions.append("unlock vault with moon key")
+        if self.location == "vault" and not self.passphrase_spoken:
+            actions.extend(f"say {word}" for word in self.PASS_OPTIONS)
+
+        for item in self._visible_items():
+            actions.append(f"take {item}")
+
+        return actions
+
+    def step(self, action: str) -> StepResult:
+        if self.done:
+            return StepResult(
+                observation=self._observation("The task is already complete."),
+                reward=0.0,
+                done=True,
+                info={"score": self.score, "valid": False},
+            )
+
+        self.steps += 1
+        normalized = " ".join(action.lower().strip().split())
+        valid = normalized in self.valid_actions()
+        reward = -0.01
+
+        if normalized in {"look", ""}:
+            message = "You look around."
+        elif normalized == "inventory":
+            message = "Inventory: " + (", ".join(self.inventory) if self.inventory else "empty") + "."
+        elif normalized == "read brass plaque":
+            self.plaque_read = True
+            message = "The brass plaque says: passphrase EMBER opens the final vault."
+            reward = 0.05
+        elif normalized == "light storm lantern":
+            if "storm lantern" not in self.inventory:
+                message = "You need the storm lantern first."
+                reward = -0.05
+            else:
+                self.lantern_lit = True
+                message = "You light the storm lantern."
+                reward = 0.05
+        elif normalized.startswith("go "):
+            message, reward = self._go(normalized[3:])
+        elif normalized.startswith("take "):
+            message, reward = self._take(normalized[5:])
+        elif normalized in {"unlock iron gate", "unlock iron gate with iron key"}:
+            message, reward = self._unlock_iron_gate()
+        elif normalized in {"inspect moon lock", "unlock vault with moon key"}:
+            message, reward = self._unlock_vault(normalized)
+        elif normalized.startswith("say "):
+            message, reward = self._say(normalized[4:])
+        else:
+            message = f"'{action}' is not a useful action here."
+            reward = -0.05
+
+        if "amber seal" in self.inventory:
+            self.done = True
+            self.score = 1.0
+            reward = 1.0
+            message += " You have recovered the amber seal."
+
+        return StepResult(
+            observation=self._observation(message),
+            reward=reward,
+            done=self.done,
+            info={
+                "score": self.score,
+                "valid": valid,
+                "steps": self.steps,
+                "location": self.location,
+                "inventory": list(self.inventory),
+            },
+        )
+
+    def _go(self, direction: str) -> tuple[str, float]:
+        exits = self.rooms[self.location]["exits"]
+        if direction not in exits:
+            return f"You cannot go {direction} from here.", -0.05
+        if self.location == "gallery" and direction == "east" and not self.iron_gate_unlocked:
+            return "The iron gate is locked.", -0.05
+        if self.location == "vault_ante" and direction == "east" and not self.vault_unlocked:
+            return "The moon lock holds the east door shut.", -0.05
+        self.location = exits[direction]
+        return f"You go {direction}.", 0.0
+
+    def _take(self, item: str) -> tuple[str, float]:
+        if item not in self._visible_items():
+            return f"There is no reachable {item} here.", -0.05
+        self._room_items[self.location].remove(item)
+        self.inventory.append(item)
+        return f"You take the {item}.", 0.1
+
+    def _unlock_iron_gate(self) -> tuple[str, float]:
+        if self.location != "gallery":
+            return "There is no iron gate here.", -0.05
+        if "iron key" not in self.inventory:
+            return "The iron gate needs an iron key.", -0.05
+        self.iron_gate_unlocked = True
+        return "You unlock the iron gate with the iron key.", 0.15
+
+    def _unlock_vault(self, action: str) -> tuple[str, float]:
+        if self.location != "vault_ante":
+            return "There is no moon lock here.", -0.05
+        if action != "unlock vault with moon key":
+            return "The moon lock is shaped for a moon key.", -0.02
+        if "moon key" not in self.inventory:
+            return "You need the moon key for the vault.", -0.05
+        self.vault_unlocked = True
+        return "You unlock the vault door with the moon key.", 0.2
+
+    def _say(self, word: str) -> tuple[str, float]:
+        if self.location != "vault":
+            return "No lock is listening here.", -0.05
+        if word == "ember":
+            self.passphrase_spoken = True
+            return "The speaking lock accepts EMBER and opens the glass case.", 0.2
+        return "The speaking lock rejects the passphrase.", -0.05
+
+    def _visible_items(self) -> list[str]:
+        items = list(self._room_items.get(self.location, []))
+        if self.location == "crypt" and not self.lantern_lit:
+            items = [item for item in items if item != "moon key"]
+        if self.location == "vault" and not self.passphrase_spoken:
+            items = [item for item in items if item != "amber seal"]
+        return items
+
+    def _observation(self, message: str) -> str:
+        room = self.rooms[self.location]
+        item_text = (
+            " Visible items: " + ", ".join(self._visible_items()) + "."
+            if self._visible_items()
+            else ""
+        )
+        inventory = " Inventory: " + ", ".join(self.inventory) + "." if self.inventory else ""
+        status = []
+        if self.location == "gallery":
+            status.append("The iron gate is unlocked." if self.iron_gate_unlocked else "The iron gate is locked.")
+        if self.location == "crypt" and not self.lantern_lit:
+            status.append("The altar is too dark to read.")
+        if self.location == "vault_ante":
+            status.append("The moon lock is open." if self.vault_unlocked else "The moon lock is closed.")
+        if self.location == "vault" and self.passphrase_spoken:
+            status.append("The glass case is open.")
+        status_text = " " + " ".join(status) if status else ""
+        return (
+            "Goal: recover the amber seal.\n"
+            f"{message}\n{room['desc']}{status_text}{item_text}{inventory}"
+        )
+
+
 class TextWorldEnv:
     """Thin adapter for a TextWorld game file.
 
@@ -253,6 +513,8 @@ class TextWorldEnv:
 def make_env(env_name: str, game_file: str | None = None) -> TextEnv:
     if env_name == "tiny":
         return TinyQuestEnv()
+    if env_name == "hard":
+        return HardQuestEnv()
     if env_name == "textworld":
         if not game_file:
             raise ValueError("--game-file is required when --env textworld")

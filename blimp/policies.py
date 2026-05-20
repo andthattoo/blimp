@@ -30,13 +30,13 @@ PROMPT_BOUNDARY_FIELDS = {
 }
 
 DEFAULT_MEMORY = {
-    "GOAL": "recover the blue gem",
+    "GOAL": "complete the environment objective",
     "LOCATION": "unknown",
     "INVENTORY": "empty",
     "MAP": "unknown",
     "OBJECTS": "unknown",
     "LOCKS": "unknown",
-    "TODO": "explore, find useful items, unlock blocked paths, recover the blue gem",
+    "TODO": "explore, find useful items, unlock blocked paths, complete the objective",
     "FAILED": "none",
 }
 
@@ -115,6 +115,77 @@ class ScriptedTinyPolicy:
         action = resolve_action(action, valid_actions) or action
         new_memory = summarize_tiny_memory(observation, memory)
         return PolicyOutput(action=action, memory=new_memory, raw_text="scripted-tiny")
+
+
+class ScriptedHardPolicy:
+    """Deterministic policy for validating HardQuestEnv mechanics."""
+
+    def act(
+        self,
+        observation: str,
+        memory: str,
+        valid_actions: list[str],
+        *,
+        history: list[str],
+        branch_hint: str,
+        rng: random.Random,
+    ) -> PolicyOutput:
+        del history, branch_hint, rng
+        obs = observation.lower()
+        text = (memory + "\n" + observation).lower()
+        inventory = _inventory_items(text)
+        action = "look"
+
+        priority_actions = [
+            "take amber seal",
+            "say ember",
+            "unlock vault with moon key",
+            "take moon key",
+            "light storm lantern",
+            "unlock iron gate with iron key",
+            "take iron key",
+            "take storm lantern",
+        ]
+        if "passphrase ember" not in text:
+            priority_actions.append("read brass plaque")
+        for candidate in priority_actions:
+            if candidate in valid_actions:
+                action = candidate
+                break
+        else:
+            if "you are in the archive" in obs:
+                action = "go south"
+            elif "you are in the pantry" in obs:
+                action = "go east"
+            elif "you are in the armory" in obs:
+                action = "go north"
+            elif "you stand in the vault antechamber" in obs:
+                action = "go east" if "go east" in valid_actions else "go west"
+            elif "you are in the final vault" in obs:
+                action = "go west"
+            elif "you are in the crypt" in obs:
+                if "moon key" in inventory and "go east" in valid_actions:
+                    action = "go east"
+                elif "go west" in valid_actions:
+                    action = "go west"
+            elif "you are in the gallery" in obs:
+                if "iron key" in inventory and "go east" in valid_actions:
+                    action = "go east"
+                elif "iron key" in inventory and "unlock iron gate" in valid_actions:
+                    action = "unlock iron gate"
+                else:
+                    action = "go south"
+            elif "you are in the atrium" in obs:
+                if "passphrase ember" not in text:
+                    action = "go north"
+                elif "storm lantern" not in inventory:
+                    action = "go west"
+                else:
+                    action = "go east"
+
+        action = resolve_action(action, valid_actions) or action
+        new_memory = summarize_hard_memory(observation, memory)
+        return PolicyOutput(action=action, memory=new_memory, raw_text="scripted-hard")
 
 
 class HFPolicy:
@@ -301,6 +372,7 @@ def corrupt_memory(memory: str, rng: random.Random) -> str:
         [
             "blue gem in garden",
             "brass key in attic",
+            "amber seal in observatory; moon key in pantry",
             "blue gem unknown; brass key unknown",
         ]
     )
@@ -308,6 +380,7 @@ def corrupt_memory(memory: str, rng: random.Random) -> str:
         [
             "south door locked by red key",
             "north door already open",
+            "final vault passphrase mirror; iron gate already open",
             "unknown",
         ]
     )
@@ -316,6 +389,7 @@ def corrupt_memory(memory: str, rng: random.Random) -> str:
             "avoid the cellar; go east, unlock the north door, then take the blue gem",
             "go east repeatedly until a garden or vault appears",
             "use the red key on the south door, then search the garden",
+            "skip the archive; say mirror in the final vault",
         ]
     )
     parsed["FAILED"] = rng.choice(
@@ -354,6 +428,88 @@ def summarize_tiny_memory(observation: str, memory: str) -> str:
     parsed["MAP"] = merge_fact(parsed["MAP"], "foyer east hall; foyer south cellar; hall north vault")
     parsed["TODO"] = "get brass key, unlock hall north door, go north to vault, take blue gem"
     return format_memory(parsed)
+
+
+def summarize_hard_memory(observation: str, memory: str) -> str:
+    parsed = parse_memory(memory)
+    text = (memory + "\n" + observation).lower()
+    parsed["GOAL"] = "recover the amber seal"
+
+    room_markers = [
+        ("you are in the atrium", "atrium"),
+        ("you are in the archive", "archive"),
+        ("you are in the pantry", "pantry"),
+        ("you are in the gallery", "gallery"),
+        ("you are in the armory", "armory"),
+        ("you are in the crypt", "crypt"),
+        ("you are in the observatory", "observatory"),
+        ("you stand in the vault antechamber", "vault antechamber"),
+        ("you are in the final vault", "final vault"),
+    ]
+    for marker, location in room_markers:
+        if marker in observation.lower():
+            parsed["LOCATION"] = location
+            break
+
+    inventory = _inventory_items(observation.lower())
+    if inventory:
+        parsed["INVENTORY"] = ", ".join(inventory)
+
+    object_facts = [
+        ("storm lantern", "storm lantern in pantry"),
+        ("iron key", "iron key in armory"),
+        ("moon key", "moon key on crypt altar"),
+        ("amber seal", "amber seal in final vault"),
+    ]
+    for marker, fact in object_facts:
+        if marker in text:
+            parsed["OBJECTS"] = merge_fact(parsed["OBJECTS"], fact)
+
+    parsed["MAP"] = (
+        "atrium north archive; atrium west pantry; atrium east gallery; "
+        "gallery south armory; gallery east crypt; crypt east vault antechamber; "
+        "vault antechamber east final vault"
+    )
+    if "passphrase ember" in text or "ember opens" in text:
+        parsed["LOCKS"] = merge_fact(parsed["LOCKS"], "final vault passphrase ember")
+    if "iron gate is locked" in text:
+        parsed["LOCKS"] = merge_fact(parsed["LOCKS"], "iron gate needs iron key")
+    if "iron gate is unlocked" in text or "unlock the iron gate" in text:
+        parsed["LOCKS"] = merge_fact(parsed["LOCKS"], "iron gate unlocked")
+    if "moon lock" in text:
+        parsed["LOCKS"] = merge_fact(parsed["LOCKS"], "moon lock needs moon key")
+    if "unlock the vault door" in text or "moon lock is open" in text:
+        parsed["LOCKS"] = merge_fact(parsed["LOCKS"], "moon lock open")
+
+    inv_text = parsed["INVENTORY"].lower()
+    if "passphrase ember" not in parsed["LOCKS"].lower():
+        parsed["TODO"] = "go to archive and read brass plaque"
+    elif "storm lantern" not in inv_text:
+        parsed["TODO"] = "go to pantry and take storm lantern"
+    elif "iron key" not in inv_text:
+        parsed["TODO"] = "go to armory and take iron key"
+    elif "iron gate unlocked" not in parsed["LOCKS"].lower():
+        parsed["TODO"] = "go to gallery and unlock iron gate with iron key"
+    elif "moon key" not in inv_text:
+        parsed["TODO"] = "go to crypt, light storm lantern, take moon key"
+    elif "moon lock open" not in parsed["LOCKS"].lower():
+        parsed["TODO"] = "go to vault antechamber and unlock vault with moon key"
+    elif "amber seal" not in inv_text:
+        parsed["TODO"] = "go east to final vault, say ember, take amber seal"
+    else:
+        parsed["TODO"] = "objective complete"
+
+    return format_memory(parsed)
+
+
+def _inventory_items(text: str) -> list[str]:
+    matches = re.findall(r"inventory:\s*([^.\n]+)", text)
+    if not matches:
+        return []
+    last = matches[-1].strip()
+    if not last or last == "empty":
+        return []
+    return [item.strip() for item in last.split(",") if item.strip()]
 
 
 def parse_memory(memory: str) -> dict[str, str]:
@@ -470,6 +626,8 @@ def make_policy(
         return RandomValidPolicy()
     if policy_name == "scripted-tiny":
         return ScriptedTinyPolicy()
+    if policy_name == "scripted-hard":
+        return ScriptedHardPolicy()
     if policy_name == "hf":
         if not model_name:
             raise ValueError("--model is required with --policy hf")

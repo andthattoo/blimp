@@ -11,10 +11,14 @@ from blimp.rollout import Variant, run_variant, summarize_runs, write_jsonl, wri
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run BLiMP A-D rollout ablations.")
-    parser.add_argument("--env", choices=["tiny", "textworld"], default="tiny")
+    parser.add_argument("--env", choices=["tiny", "hard", "textworld"], default="tiny")
     parser.add_argument("--game-file", default=None, help="TextWorld game file.")
     parser.add_argument("--game-dir", default=None, help="Directory of TextWorld .ulx/.z8 games.")
-    parser.add_argument("--policy", choices=["random", "scripted-tiny", "hf"], default="random")
+    parser.add_argument(
+        "--policy",
+        choices=["random", "scripted-tiny", "scripted-hard", "hf"],
+        default="random",
+    )
     parser.add_argument("--model", default=None, help="HF model name for --policy hf.")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--trust-remote-code", action="store_true")

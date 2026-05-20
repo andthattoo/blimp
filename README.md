@@ -21,7 +21,7 @@ For branching variants, the output reports both the solved root-to-leaf horizon 
 
 ## Quick Smoke Test
 
-The built-in `tiny` environment is only for validating the rollout mechanics before running TextWorld or Minecraft-style tasks.
+The built-in `tiny` environment is only for validating basic rollout mechanics before running TextWorld or Minecraft-style tasks. The `hard` environment is a deterministic local stress test with a passphrase clue, tool chain, locked gate, moon lock, and final memory-dependent vault action.
 
 ```bash
 python -m blimp.run_experiment \
@@ -30,6 +30,23 @@ python -m blimp.run_experiment \
   --episodes 3 \
   --variants A,B,C,D \
   --out runs/tiny-smoke
+```
+
+Harder local memory smoke:
+
+```bash
+python -m blimp.run_experiment \
+  --env hard \
+  --policy scripted-hard \
+  --episodes 1 \
+  --variants A,B,C,D \
+  --flat-steps 60 \
+  --chain-blocks 8 \
+  --branch-factor 2 \
+  --branch-depth 8 \
+  --branch-action-budget 120 \
+  --memory-words 240 \
+  --out runs/hard-smoke
 ```
 
 Outputs:
