@@ -7,6 +7,29 @@ from difflib import get_close_matches
 from typing import Protocol
 
 
+MEMORY_FIELDS = [
+    "GOAL",
+    "LOCATION",
+    "INVENTORY",
+    "MAP",
+    "OBJECTS",
+    "LOCKS",
+    "TODO",
+    "FAILED",
+]
+
+DEFAULT_MEMORY = {
+    "GOAL": "recover the blue gem",
+    "LOCATION": "unknown",
+    "INVENTORY": "empty",
+    "MAP": "unknown",
+    "OBJECTS": "unknown",
+    "LOCKS": "unknown",
+    "TODO": "explore, find useful items, unlock blocked paths, recover the blue gem",
+    "FAILED": "none",
+}
+
+
 @dataclass
 class PolicyOutput:
     action: str
@@ -41,7 +64,7 @@ class RandomValidPolicy:
     ) -> PolicyOutput:
         del observation, history, branch_hint
         action = rng.choice(valid_actions) if valid_actions else "look"
-        return PolicyOutput(action=action, memory=memory, raw_text="random-valid")
+        return PolicyOutput(action=action, memory=normalize_memory(memory), raw_text="random-valid")
 
 
 class ScriptedTinyPolicy:
@@ -150,9 +173,10 @@ class HFPolicy:
         action = resolve_action(parsed_action, valid_actions)
         if action is None:
             action = valid_actions[0] if valid_actions else parsed_action or "look"
+        merged_memory = merge_memory_patch(memory, parsed_memory)
         return PolicyOutput(
             action=action,
-            memory=parsed_memory or memory,
+            memory=merged_memory,
             raw_text=generated.strip(),
         )
 
@@ -166,16 +190,25 @@ def build_prompt(
 ) -> str:
     actions = "\n".join(f"- {action}" for action in valid_actions) or "- look"
     recent = "\n".join(history[-8:]) if history else "None."
-    memory_text = memory.strip() or "None yet."
+    memory_text = normalize_memory(memory)
     return f"""You are an agent in a text environment.
 Complete the environment objective as directly as possible.
-Choose exactly one valid action and update compact memory for future short blocks.
+Choose exactly one valid action and update structured memory for future short blocks.
 If a goal-relevant item is visible and a matching take action is valid, take it.
 Do not invent rooms, objects, exits, or actions that are not in the observation.
+Use memory for durable offscreen facts only. If a fact is unknown, write unknown.
 
 Output exactly:
 ACTION: <one valid action>
-MEMORY: <short durable state, max 4 bullets or one sentence>
+MEMORY_PATCH:
+GOAL: <current objective>
+LOCATION: <current known location>
+INVENTORY: <items held, or empty>
+MAP: <known room/exit edges>
+OBJECTS: <known object locations>
+LOCKS: <locked/unlocked doors and required keys>
+TODO: <next useful subgoals>
+FAILED: <failed actions or loops to avoid>
 
 Branch hint: {branch_hint}
 
@@ -204,7 +237,7 @@ def parse_action_memory(text: str) -> tuple[str, str]:
         first = next((line.strip() for line in text.splitlines() if line.strip()), "")
         action = first.removeprefix("-").strip()
 
-    memory_match = re.search(r"(?ims)^\s*MEMORY\s*:\s*(.+)$", text)
+    memory_match = re.search(r"(?ims)^\s*MEMORY(?:_PATCH)?\s*:\s*(.+)$", text)
     if memory_match:
         memory = memory_match.group(1).strip()
         memory = re.split(r"(?im)^\s*(ACTION|OBSERVATION|VALID ACTIONS)\s*:", memory)[0]
@@ -239,35 +272,148 @@ def truncate_memory(memory: str, max_words: int) -> str:
 
 
 def corrupt_memory(memory: str, rng: random.Random) -> str:
-    if not memory.strip():
-        return "Memory is unreliable: previous notes may be false or irrelevant."
-    words = memory.split()
-    rng.shuffle(words)
-    shuffled = " ".join(words[: min(len(words), 80)])
-    return (
-        "Corrupted memory, do not trust ordering or facts: "
-        + shuffled
-        + " Contradiction: the last useful location may be wrong."
+    parsed = parse_memory(memory)
+    distractor_locations = ["attic", "garden", "library", "river"]
+    parsed["LOCATION"] = rng.choice(distractor_locations)
+    parsed["INVENTORY"] = rng.choice(["empty", "silver coin", "red key"])
+    parsed["MAP"] = rng.choice(
+        [
+            "attic -> garden; garden -> river",
+            "library -> tower; tower -> cellar",
+            "unknown",
+        ]
     )
+    parsed["OBJECTS"] = rng.choice(
+        [
+            "blue gem in garden",
+            "brass key in attic",
+            "blue gem unknown; brass key unknown",
+        ]
+    )
+    parsed["LOCKS"] = rng.choice(
+        [
+            "south door locked by red key",
+            "north door already open",
+            "unknown",
+        ]
+    )
+    parsed["TODO"] = "treat memory as corrupted; rely on current observation and recover durable facts"
+    parsed["FAILED"] = "previous memory may be false"
+    return format_memory(parsed)
 
 
 def summarize_tiny_memory(observation: str, memory: str) -> str:
-    facts: list[str] = []
+    parsed = parse_memory(memory)
     text = (memory + "\n" + observation).lower()
+    parsed["GOAL"] = "recover the blue gem"
+    if "you are in the foyer" in text:
+        parsed["LOCATION"] = "foyer"
+    elif "you are in a cold cellar" in text:
+        parsed["LOCATION"] = "cellar"
+    elif "you are in a long hall" in text:
+        parsed["LOCATION"] = "hall"
+    elif "you are in the vault" in text:
+        parsed["LOCATION"] = "vault"
     if "brass key" in text:
         if "inventory: brass key" in text or "you take the brass key" in text:
-            facts.append("Have brass key.")
+            parsed["INVENTORY"] = "brass key"
         else:
-            facts.append("Brass key is in cellar.")
+            parsed["OBJECTS"] = merge_fact(parsed["OBJECTS"], "brass key in cellar")
     if "north door is unlocked" in text or "you unlock the north door" in text:
-        facts.append("North hall door unlocked.")
+        parsed["LOCKS"] = merge_fact(parsed["LOCKS"], "hall north door unlocked")
     elif "north door is locked" in text:
-        facts.append("North hall door locked.")
+        parsed["LOCKS"] = merge_fact(parsed["LOCKS"], "hall north door locked; needs brass key")
     if "blue gem" in text:
-        facts.append("Goal gem is in vault north of hall.")
-    if not facts:
-        facts.append("Explore foyer, cellar, hall, then vault.")
-    return " ".join(dict.fromkeys(facts))
+        parsed["OBJECTS"] = merge_fact(parsed["OBJECTS"], "blue gem in vault")
+    parsed["MAP"] = merge_fact(parsed["MAP"], "foyer east hall; foyer south cellar; hall north vault")
+    parsed["TODO"] = "get brass key, unlock hall north door, go north to vault, take blue gem"
+    return format_memory(parsed)
+
+
+def parse_memory(memory: str) -> dict[str, str]:
+    parsed = dict(DEFAULT_MEMORY)
+    if not memory.strip():
+        return parsed
+
+    current_field: str | None = None
+    current_lines: list[str] = []
+    for raw_line in memory.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r"^([A-Za-z_]+)\s*:\s*(.*)$", line)
+        if match and match.group(1).upper() in MEMORY_FIELDS:
+            if current_field is not None:
+                parsed[current_field] = clean_memory_value(" ".join(current_lines))
+            current_field = match.group(1).upper()
+            current_lines = [match.group(2).strip()]
+        elif current_field is not None:
+            current_lines.append(line)
+
+    if current_field is not None:
+        parsed[current_field] = clean_memory_value(" ".join(current_lines))
+    elif memory.strip():
+        parsed["TODO"] = clean_memory_value(memory.strip())
+
+    return parsed
+
+
+def format_memory(memory: dict[str, str]) -> str:
+    lines = []
+    for field in MEMORY_FIELDS:
+        value = clean_memory_value(memory.get(field, DEFAULT_MEMORY[field]))
+        lines.append(f"{field}: {value}")
+    return "\n".join(lines)
+
+
+def normalize_memory(memory: str) -> str:
+    return format_memory(parse_memory(memory))
+
+
+def merge_memory_patch(base: str, patch: str) -> str:
+    parsed = parse_memory(base)
+    if not patch.strip():
+        return format_memory(parsed)
+    for field, value in parse_memory_patch_fields(patch).items():
+        if value and value.lower() not in {"unknown", "none", "n/a"}:
+            parsed[field] = clean_memory_value(value)
+    return format_memory(parsed)
+
+
+def parse_memory_patch_fields(patch: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    current_field: str | None = None
+    current_lines: list[str] = []
+    for raw_line in patch.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r"^([A-Za-z_]+)\s*:\s*(.*)$", line)
+        if match and match.group(1).upper() in MEMORY_FIELDS:
+            if current_field is not None:
+                parsed[current_field] = clean_memory_value(" ".join(current_lines))
+            current_field = match.group(1).upper()
+            current_lines = [match.group(2).strip()]
+        elif current_field is not None:
+            current_lines.append(line)
+    if current_field is not None:
+        parsed[current_field] = clean_memory_value(" ".join(current_lines))
+    return parsed
+
+
+def merge_fact(existing: str, fact: str) -> str:
+    if not existing or existing.lower() in {"unknown", "none"}:
+        return fact
+    parts = [part.strip() for part in re.split(r"[;\n]", existing) if part.strip()]
+    if fact not in parts:
+        parts.append(fact)
+    return "; ".join(parts)
+
+
+def clean_memory_value(value: str) -> str:
+    value = " ".join(value.split())
+    value = re.sub(r"(?i)\b(ACTION|OBSERVATION|VALID ACTIONS|MEMORY_PATCH)\s*:.*$", "", value)
+    return value.strip(" -") or "unknown"
 
 
 def make_policy(
