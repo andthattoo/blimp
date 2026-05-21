@@ -614,6 +614,13 @@ def main() -> None:
     parser.add_argument("--eval-episodes", type=int, default=2)
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=50)
+    parser.add_argument(
+        "--eval-max-steps",
+        type=int,
+        default=None,
+        help="Optional smaller step cap for evaluation episodes.",
+    )
+    parser.add_argument("--skip-initial-eval", action="store_true")
     parser.add_argument("--block-len", type=int, default=5)
     parser.add_argument("--memory-words", type=int, default=240)
     parser.add_argument("--memory-max-tokens", type=int, default=160)
@@ -696,7 +703,10 @@ def main() -> None:
     started = time.time()
     global_episode = 0
     for update in range(args.updates + 1):
-        if update % args.eval_every == 0:
+        should_eval = update % args.eval_every == 0 and not (
+            update == 0 and args.skip_initial_eval
+        )
+        if should_eval:
             eval_traces = []
             for i in range(args.eval_episodes):
                 trace = run_episode(
@@ -709,7 +719,7 @@ def main() -> None:
                     ),
                     seed=args.seed,
                     mode=args.mode,
-                    max_steps=args.max_steps,
+                    max_steps=args.eval_max_steps or args.max_steps,
                     block_len=args.block_len,
                     memory_words=args.memory_words,
                     memory_max_tokens=args.memory_max_tokens,
