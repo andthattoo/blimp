@@ -456,6 +456,7 @@ class TextWorldEnv:
         self.game_file = str(game_file)
         self._env = None
         self._state = None
+        self._last_score = 0.0
 
     def reset(self, seed: int | None = None) -> str:
         del seed
@@ -484,6 +485,7 @@ class TextWorldEnv:
         except TypeError:
             self._env = textworld.start(self.game_file, infos=infos)
         self._state = self._env.reset()
+        self._last_score = self._score_from_state(self._state, fallback=0.0)
         return self._feedback(self._state)
 
     def valid_actions(self) -> list[str]:
@@ -495,21 +497,39 @@ class TextWorldEnv:
         if self._env is None:
             raise RuntimeError("TextWorld environment must be reset before stepping.")
         was_valid = action in self.valid_actions()
-        self._state, reward, done = self._env.step(action)
-        score = float(getattr(self._state, "score", reward) or reward)
+        self._state, raw_reward, done = self._env.step(action)
+        score = self._score_from_state(self._state, fallback=float(raw_reward))
+        score_delta = score - self._last_score
+        self._last_score = score
         return StepResult(
             observation=self._feedback(self._state),
-            reward=float(reward),
+            reward=score_delta,
             done=bool(done),
             info={
                 "score": score,
-                "max_score": float(getattr(self._state, "max_score", 0.0) or 0.0),
+                "max_score": self._max_score_from_state(self._state),
+                "score_delta": score_delta,
+                "raw_reward": float(raw_reward),
                 "valid": was_valid,
                 "admissible_commands": self.valid_actions(),
                 "won": bool(getattr(self._state, "won", False)),
                 "lost": bool(getattr(self._state, "lost", False)),
             },
         )
+
+    @staticmethod
+    def _score_from_state(state: Any, *, fallback: float) -> float:
+        score = getattr(state, "score", None)
+        if score is None:
+            return fallback
+        return float(score)
+
+    @staticmethod
+    def _max_score_from_state(state: Any) -> float:
+        max_score = getattr(state, "max_score", None)
+        if max_score is None:
+            return 0.0
+        return float(max_score)
 
     @staticmethod
     def _feedback(state: Any) -> str:
