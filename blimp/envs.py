@@ -623,13 +623,11 @@ class ScienceWorldEnv:
                 "picture",
             }:
                 return False
-            phase_match = re.search(
-                r"\b(?:boil|melt|freeze)\s+([a-z][a-z0-9 -]*?)(?:\.|,|$)",
-                self._task_description.lower(),
-            )
-            if phase_match:
-                desired = phase_match.group(1).strip()
-                return target == desired or target in desired or desired in target
+            desired = self._phase_target()
+            if desired:
+                # `focus on orange` is terminally wrong for `boil orange juice`;
+                # allow exact target hits or fuller object descriptions only.
+                return target == desired or desired in target
 
         # These combinatorial templates massively inflate the action space and
         # are rarely useful as first-pass LM actions without tool-specific
@@ -637,6 +635,15 @@ class ScienceWorldEnv:
         if action.startswith(("mix ", "eat ")):
             return False
         return True
+
+    def _phase_target(self) -> str | None:
+        phase_match = re.search(
+            r"\b(?:boil|melt|freeze)\s+([a-z][a-z0-9 -]*?)(?:\.|,|$)",
+            self._task_description.lower(),
+        )
+        if not phase_match:
+            return None
+        return " ".join(phase_match.group(1).strip().split())
 
     def step(self, action: str) -> StepResult:
         if self._env is None:
