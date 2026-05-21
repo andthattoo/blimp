@@ -535,6 +535,111 @@ class TextWorldEnv:
         return "\n".join(str(part) for part in parts if part).strip()
 
 
+class ScienceWorldEnv:
+    """Thin adapter for a single ScienceWorld task variation spec.
+
+    The spec format is `task:variation:simplification[:step_limit]`, for example
+    `use-thermometer:17:easy:100`. ScienceWorld uses a Java backend; this adapter
+    keeps one backend process per Python process and reloads task variations.
+    """
+
+    _backend: Any = None
+    _step_limit: int | None = None
+
+    def __init__(self, spec: str | Path) -> None:
+        task_name, variation, simplification, step_limit = self._parse_spec(str(spec))
+        self.task_name = task_name
+        self.variation = variation
+        self.simplification = simplification
+        self.step_limit = step_limit
+        self._env = None
+        self._score = 0.0
+        self._done = False
+
+    @staticmethod
+    def _parse_spec(spec: str) -> tuple[str, int, str, int]:
+        parts = spec.split(":")
+        if len(parts) < 2:
+            raise ValueError(
+                "ScienceWorld spec must be task:variation:simplification[:step_limit]"
+            )
+        task_name = parts[0]
+        variation = int(parts[1])
+        simplification = parts[2] if len(parts) >= 3 else "easy"
+        step_limit = int(parts[3]) if len(parts) >= 4 else 100
+        return task_name, variation, simplification, step_limit
+
+    @classmethod
+    def _get_backend(cls, step_limit: int) -> Any:
+        if cls._backend is None or cls._step_limit != step_limit:
+            try:
+                from scienceworld import ScienceWorldEnv as BackendEnv
+            except ImportError as exc:
+                raise RuntimeError(
+                    "ScienceWorld is not installed. Install with `pip install scienceworld`."
+                ) from exc
+            cls._backend = BackendEnv("", None, envStepLimit=step_limit)
+            cls._step_limit = step_limit
+        return cls._backend
+
+    def reset(self, seed: int | None = None) -> str:
+        del seed
+        self._env = self._get_backend(self.step_limit)
+        self._env.load(self.task_name, self.variation, self.simplification)
+        observation, info = self._env.reset()
+        self._score = float(info.get("score", 0.0) or 0.0)
+        self._done = False
+        return self._feedback(observation)
+
+    def valid_actions(self) -> list[str]:
+        if self._env is None or self._done:
+            return []
+        try:
+            rows = self._env.get_valid_action_object_combinations_with_templates()
+            actions = [str(row["action"]).lower().strip() for row in rows if row.get("action")]
+        except Exception:
+            actions = []
+        actions.extend(["look around", "inventory", "task description"])
+        return sorted(set(action for action in actions if action))
+
+    def step(self, action: str) -> StepResult:
+        if self._env is None:
+            raise RuntimeError("ScienceWorld environment must be reset before stepping.")
+        normalized = " ".join(action.lower().strip().split())
+        was_valid = normalized in self.valid_actions()
+        observation, reward, done, info = self._env.step(normalized)
+        self._score = float(info.get("score", self._score) or self._score)
+        won = self._score >= 100.0
+        self._done = bool(done)
+        return StepResult(
+            observation=self._feedback(observation),
+            reward=float(reward),
+            done=bool(done),
+            info={
+                "score": self._score,
+                "max_score": 100.0,
+                "valid": was_valid,
+                "won": won,
+                "task_name": self.task_name,
+                "variation": self.variation,
+                "simplification": self.simplification,
+            },
+        )
+
+    def _feedback(self, observation: str) -> str:
+        assert self._env is not None
+        parts = [
+            f"Task: {self.task_name}",
+            f"Variation: {self.variation}",
+            f"Goal: {self._env.get_task_description()}",
+            f"Observation: {observation}",
+            f"Look: {self._env.look()}",
+            f"Inventory: {self._env.inventory()}",
+            f"Score: {self._score}/100",
+        ]
+        return "\n".join(str(part) for part in parts if part).strip()
+
+
 def make_env(env_name: str, game_file: str | None = None) -> TextEnv:
     if env_name == "tiny":
         return TinyQuestEnv()
@@ -544,6 +649,10 @@ def make_env(env_name: str, game_file: str | None = None) -> TextEnv:
         if not game_file:
             raise ValueError("--game-file is required when --env textworld")
         return TextWorldEnv(game_file)
+    if env_name == "scienceworld":
+        if not game_file:
+            raise ValueError("ScienceWorld requires a task variation spec")
+        return ScienceWorldEnv(game_file)
     raise ValueError(f"Unknown environment: {env_name}")
 
 

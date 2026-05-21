@@ -15,6 +15,36 @@ from blimp.envs import make_env
 from blimp.sglang_rollout import build_action_prompt, build_memory_prompt, strip_reasoning
 
 
+SCIENCEWORLD_TASK_VARIATIONS: dict[str, int] = {
+    "boil": 30,
+    "melt": 30,
+    "freeze": 30,
+    "use-thermometer": 540,
+    "measure-melting-point-known-substance": 300,
+    "measure-melting-point-unknown-substance": 300,
+    "test-conductivity": 900,
+    "test-conductivity-of-unknown-substances": 900,
+    "find-living-thing": 300,
+    "find-non-living-thing": 300,
+    "find-plant": 300,
+    "find-animal": 300,
+    "grow-plant": 300,
+    "grow-fruit": 300,
+    "lifespan-longest-lived": 300,
+    "lifespan-shortest-lived": 300,
+    "inclined-plane-determine-angle": 180,
+    "inclined-plane-friction-unnamed-surfaces": 180,
+    "mendelian-genetics-known-plant": 300,
+}
+
+DEFAULT_SCIENCEWORLD_TASKS = (
+    "boil,melt,freeze,use-thermometer,measure-melting-point-known-substance,"
+    "test-conductivity,find-living-thing,find-non-living-thing,find-plant,"
+    "find-animal,grow-plant,grow-fruit,lifespan-longest-lived,"
+    "inclined-plane-determine-angle"
+)
+
+
 @dataclass
 class Transition:
     prompt: str
@@ -365,7 +395,8 @@ def run_episode(
         result = env.step(action)
         score = float(result.info.get("score", result.reward))
         reward = float(result.reward)
-        if result.done:
+        step_success = transition_success(result.done, score, result.info)
+        if step_success:
             reward += 1.0
         total_reward += reward
         transitions.append(
@@ -382,8 +413,8 @@ def run_episode(
         full_history.append(history_line)
         block_history.append(history_line)
         observation = result.observation
-        solved = result.done
-        if solved:
+        solved = step_success
+        if result.done or solved:
             break
 
         if memory_enabled and (t + 1) % block_len == 0:
@@ -455,6 +486,42 @@ def find_game_files(game_file: str | None, game_dir: str | None) -> list[str]:
     return sorted(str(path) for path in root.rglob("*") if path.suffix.lower() in suffixes)
 
 
+def parse_scienceworld_tasks(raw: str) -> list[str]:
+    return [task.strip() for task in raw.split(",") if task.strip()]
+
+
+def build_scienceworld_specs(
+    *,
+    tasks: list[str],
+    simplification: str,
+    step_limit: int,
+    train_examples: int,
+    eval_examples: int,
+    seed: int,
+) -> tuple[list[str], list[str]]:
+    all_specs: list[str] = []
+    for task in tasks:
+        if task not in SCIENCEWORLD_TASK_VARIATIONS:
+            raise ValueError(
+                f"Unknown ScienceWorld task `{task}`. Add its variation count to "
+                "SCIENCEWORLD_TASK_VARIATIONS before using it."
+            )
+        count = SCIENCEWORLD_TASK_VARIATIONS[task]
+        all_specs.extend(
+            f"{task}:{variation}:{simplification}:{step_limit}"
+            for variation in range(count)
+        )
+    rng = random.Random(seed)
+    rng.shuffle(all_specs)
+    needed = train_examples + eval_examples
+    if needed > len(all_specs):
+        raise ValueError(
+            f"Requested {needed} ScienceWorld specs but selected tasks provide "
+            f"only {len(all_specs)} variations."
+        )
+    return all_specs[:train_examples], all_specs[train_examples:needed]
+
+
 def select_game_file(game_files: list[str], index: int) -> str | None:
     if not game_files:
         return None
@@ -479,16 +546,34 @@ def maybe_init_wandb(args: argparse.Namespace, config: dict[str, Any]) -> Any:
     )
 
 
+def transition_success(done: bool, score: float, info: dict[str, Any]) -> bool:
+    if "won" in info:
+        return bool(info["won"])
+    max_score = float(info.get("max_score", 0.0) or 0.0)
+    if max_score > 0:
+        return score >= max_score
+    return done and score >= 1.0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Online REINFORCE over valid text-environment actions."
     )
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--env", choices=["tiny", "hard", "textworld"], default="hard")
+    parser.add_argument(
+        "--env",
+        choices=["tiny", "hard", "textworld", "scienceworld"],
+        default="hard",
+    )
     parser.add_argument("--game-file", default=None)
     parser.add_argument("--game-dir", default=None)
     parser.add_argument("--eval-game-file", default=None)
     parser.add_argument("--eval-game-dir", default=None)
+    parser.add_argument("--scienceworld-tasks", default=DEFAULT_SCIENCEWORLD_TASKS)
+    parser.add_argument("--scienceworld-simplification", default="easy")
+    parser.add_argument("--scienceworld-step-limit", type=int, default=100)
+    parser.add_argument("--scienceworld-train-examples", type=int, default=2048)
+    parser.add_argument("--scienceworld-eval-examples", type=int, default=256)
     parser.add_argument("--mode", choices=["standard", "blimp"], default="blimp")
     parser.add_argument("--updates", type=int, default=20)
     parser.add_argument("--episodes-per-update", type=int, default=2)
@@ -524,10 +609,30 @@ def main() -> None:
 
     train_game_files = find_game_files(args.game_file, args.game_dir)
     eval_game_files = find_game_files(args.eval_game_file, args.eval_game_dir) or train_game_files
+    if args.env == "scienceworld":
+        if args.game_file or args.game_dir:
+            train_game_files = find_game_files(args.game_file, args.game_dir)
+            eval_game_files = (
+                find_game_files(args.eval_game_file, args.eval_game_dir)
+                or train_game_files
+            )
+        else:
+            train_game_files, eval_game_files = build_scienceworld_specs(
+                tasks=parse_scienceworld_tasks(args.scienceworld_tasks),
+                simplification=args.scienceworld_simplification,
+                step_limit=args.scienceworld_step_limit,
+                train_examples=args.scienceworld_train_examples,
+                eval_examples=args.scienceworld_eval_examples,
+                seed=args.seed,
+            )
     if args.env == "textworld" and not train_game_files:
         raise ValueError("TextWorld training requires --game-file or --game-dir")
     if args.env == "textworld" and not eval_game_files:
         raise ValueError("TextWorld evaluation requires --eval-game-file/--eval-game-dir or train games")
+    if args.env == "scienceworld" and not train_game_files:
+        raise ValueError("ScienceWorld training requires generated or file-based specs")
+    if args.env == "scienceworld" and not eval_game_files:
+        raise ValueError("ScienceWorld evaluation requires generated or file-based specs")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

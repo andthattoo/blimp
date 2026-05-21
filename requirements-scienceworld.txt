@@ -1,0 +1,2 @@
+-r requirements-train.txt
+scienceworld>=1.1.3
