@@ -165,12 +165,27 @@ class ValidActionPolicy:
         self.model.eval()
         completions = [action_completion(action) for action in valid_actions]
         scores = []
-        for start in range(0, len(completions), self.score_batch_size):
-            batch = completions[start : start + self.score_batch_size]
-            scores.extend(
-                float(logprob.detach().cpu())
-                for logprob in self.completion_logprobs(prompt, batch)
-            )
+        start = 0
+        batch_size = self.score_batch_size
+        while start < len(completions):
+            batch = completions[start : start + batch_size]
+            try:
+                scores.extend(
+                    float(logprob.detach().cpu())
+                    for logprob in self.completion_logprobs(prompt, batch)
+                )
+                start += len(batch)
+            except torch.OutOfMemoryError:
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                if batch_size <= 1:
+                    raise
+                batch_size = max(1, batch_size // 2)
+                self.score_batch_size = min(self.score_batch_size, batch_size)
+                print(
+                    f"action scoring OOM; retrying with score_batch_size={batch_size}",
+                    flush=True,
+                )
         return scores
 
     def choose_action(
@@ -233,12 +248,13 @@ class ValidActionPolicy:
 
         context = torch.enable_grad() if grad else torch.no_grad()
         with context:
-            logits = self.model(full_ids[:, :-1]).logits[0]
-            targets = full_ids[0, 1:]
-            first_completion_target = max(prompt_ids.shape[1] - 1, 0)
-            completion_logits = logits[first_completion_target:].float()
-            completion_targets = targets[first_completion_target:]
-            token_logprobs = F.log_softmax(completion_logits, dim=-1)
+            completion_tokens = full_ids.shape[1] - prompt_ids.shape[1]
+            logits = self._completion_logits(
+                full_ids[:, :-1],
+                logits_to_keep=completion_tokens,
+            )[0].float()
+            completion_targets = full_ids[0, 1:][-completion_tokens:]
+            token_logprobs = F.log_softmax(logits, dim=-1)
             gathered = token_logprobs.gather(1, completion_targets[:, None]).squeeze(1)
             return gathered.mean()
 
@@ -263,25 +279,43 @@ class ValidActionPolicy:
         if input_ids.shape[1] <= prompt_ids.shape[1]:
             return torch.zeros((len(completions),), device=self.device)
 
-        logits = self.model(
+        completion_tokens = input_ids.shape[1] - prompt_ids.shape[1]
+        logits = self._completion_logits(
             input_ids[:, :-1],
             attention_mask=attention_mask[:, :-1],
-        ).logits
-        targets = input_ids[:, 1:]
-        first_completion_target = max(prompt_ids.shape[1] - 1, 0)
-        sequence_lengths = attention_mask.sum(dim=1)
-        scores = []
-        for row, sequence_length in enumerate(sequence_lengths.tolist()):
-            end = sequence_length - 1
-            if end <= first_completion_target:
-                scores.append(torch.zeros((), device=self.device))
-            else:
-                row_logits = logits[row, first_completion_target:end].float()
-                row_targets = targets[row, first_completion_target:end]
-                token_logprobs = F.log_softmax(row_logits, dim=-1)
-                gathered = token_logprobs.gather(1, row_targets[:, None]).squeeze(1)
-                scores.append(gathered.mean())
-        return torch.stack(scores)
+            logits_to_keep=completion_tokens,
+        ).float()
+        targets = input_ids[:, 1:][:, -completion_tokens:]
+        target_mask = attention_mask[:, 1:][:, -completion_tokens:].bool()
+        token_logprobs = F.log_softmax(logits, dim=-1)
+        gathered = token_logprobs.gather(2, targets[:, :, None]).squeeze(2)
+        masked = gathered.masked_fill(~target_mask, 0.0)
+        denominators = target_mask.sum(dim=1).clamp_min(1)
+        return masked.sum(dim=1) / denominators
+
+    def _completion_logits(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        logits_to_keep: int,
+    ) -> torch.Tensor:
+        """Return only logits needed for completion tokens when the model supports it."""
+        logits_to_keep = max(1, int(logits_to_keep))
+        try:
+            output = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                logits_to_keep=logits_to_keep,
+            )
+            logits = output.logits
+        except TypeError:
+            output = self.model(input_ids, attention_mask=attention_mask)
+            logits = output.logits[:, -logits_to_keep:]
+
+        if logits.shape[1] != logits_to_keep:
+            logits = logits[:, -logits_to_keep:]
+        return logits
 
     def update(
         self,
