@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -555,6 +556,7 @@ class ScienceWorldEnv:
         self._env = None
         self._score = 0.0
         self._done = False
+        self._task_description = ""
 
     @staticmethod
     def _parse_spec(spec: str) -> tuple[str, int, str, int]:
@@ -587,6 +589,7 @@ class ScienceWorldEnv:
         self._env = self._get_backend(self.step_limit)
         self._env.load(self.task_name, self.variation, self.simplification)
         observation, info = self._env.reset()
+        self._task_description = str(self._env.get_task_description())
         self._score = float(info.get("score", 0.0) or 0.0)
         self._done = False
         return self._feedback(observation)
@@ -599,8 +602,41 @@ class ScienceWorldEnv:
             actions = [str(row["action"]).lower().strip() for row in rows if row.get("action")]
         except Exception:
             actions = []
-        actions.extend(["look around", "inventory", "task description"])
-        return sorted(set(action for action in actions if action))
+        actions.extend(["look around", "inventory"])
+        return sorted(set(action for action in actions if self._keep_action(action)))
+
+    def _keep_action(self, action: str) -> bool:
+        action = " ".join(action.lower().strip().split())
+        if not action:
+            return False
+
+        # ScienceWorld exposes many valid-but-immediately-failing focus actions
+        # such as `focus on air` for phase-change tasks. Keep focus only when it
+        # plausibly targets the substance named by the task.
+        if action.startswith("focus on "):
+            target = action.removeprefix("focus on ").strip()
+            if target in {
+                "agent",
+                "air",
+                "inventory",
+                "hallway",
+                "picture",
+            }:
+                return False
+            phase_match = re.search(
+                r"\b(?:boil|melt|freeze)\s+([a-z][a-z0-9 -]*?)(?:\.|,|$)",
+                self._task_description.lower(),
+            )
+            if phase_match:
+                desired = phase_match.group(1).strip()
+                return target == desired or target in desired or desired in target
+
+        # These combinatorial templates massively inflate the action space and
+        # are rarely useful as first-pass LM actions without tool-specific
+        # structure. Re-enable later if a task family needs them.
+        if action.startswith(("mix ", "eat ")):
+            return False
+        return True
 
     def step(self, action: str) -> StepResult:
         if self._env is None:
@@ -631,7 +667,7 @@ class ScienceWorldEnv:
         parts = [
             f"Task: {self.task_name}",
             f"Variation: {self.variation}",
-            f"Goal: {self._env.get_task_description()}",
+            f"Goal: {self._task_description}",
             f"Observation: {observation}",
             f"Look: {self._env.look()}",
             f"Inventory: {self._env.inventory()}",

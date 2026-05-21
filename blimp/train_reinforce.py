@@ -604,6 +604,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--log-episodes", action="store_true")
+    parser.add_argument("--no-save-model", action="store_true")
     parser.add_argument("--out", default="runs/reinforce-latest")
     args = parser.parse_args()
 
@@ -661,8 +663,9 @@ def main() -> None:
     global_episode = 0
     for update in range(args.updates + 1):
         if update % args.eval_every == 0:
-            eval_traces = [
-                run_episode(
+            eval_traces = []
+            for i in range(args.eval_episodes):
+                trace = run_episode(
                     policy=policy,
                     episode_id=10_000 + update * 100 + i,
                     env_name=args.env,
@@ -682,8 +685,25 @@ def main() -> None:
                     greedy=True,
                     rng=rng,
                 )
-                for i in range(args.eval_episodes)
-            ]
+                eval_traces.append(trace)
+                if args.log_episodes:
+                    print(
+                        json.dumps(
+                            {
+                                "phase": "eval_episode",
+                                "update": update,
+                                "episode": i,
+                                "solved": trace.solved,
+                                "score": trace.score,
+                                "total_reward": trace.total_reward,
+                                "steps": len(trace.actions),
+                                "last_action": trace.actions[-1]
+                                if trace.actions
+                                else None,
+                            }
+                        ),
+                        flush=True,
+                    )
             eval_summary = summarize(eval_traces)
             row = {
                 "phase": "eval",
@@ -703,8 +723,9 @@ def main() -> None:
         if update == args.updates:
             break
 
-        train_traces = [
-            run_episode(
+        train_traces = []
+        for i in range(args.episodes_per_update):
+            trace = run_episode(
                 policy=policy,
                 episode_id=global_episode + i,
                 env_name=args.env,
@@ -721,8 +742,25 @@ def main() -> None:
                 greedy=False,
                 rng=rng,
             )
-            for i in range(args.episodes_per_update)
-        ]
+            train_traces.append(trace)
+            if args.log_episodes:
+                print(
+                    json.dumps(
+                        {
+                            "phase": "train_episode",
+                            "update": update + 1,
+                            "episode": global_episode + i,
+                            "solved": trace.solved,
+                            "score": trace.score,
+                            "total_reward": trace.total_reward,
+                            "steps": len(trace.actions),
+                            "last_action": trace.actions[-1]
+                            if trace.actions
+                            else None,
+                        }
+                    ),
+                    flush=True,
+                )
         global_episode += args.episodes_per_update
         update_stats = policy.update(
             train_traces,
@@ -746,7 +784,8 @@ def main() -> None:
             wandb_run.log(row, step=update + 1)
         print(json.dumps(row), flush=True)
 
-    policy.save(out_dir / "adapter")
+    if not args.no_save_model:
+        policy.save(out_dir / "adapter")
     summary_rows = [
         json.loads(line) for line in (out_dir / "metrics.jsonl").read_text().splitlines()
     ]
