@@ -647,6 +647,12 @@ def main() -> None:
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--log-episodes", action="store_true")
     parser.add_argument("--no-save-model", action="store_true")
+    parser.add_argument(
+        "--save-every-updates",
+        type=int,
+        default=0,
+        help="Save full model checkpoints every N training updates. Use 0 to disable.",
+    )
     parser.add_argument("--out", default="runs/reinforce-latest")
     args = parser.parse_args()
 
@@ -827,6 +833,13 @@ def main() -> None:
         if wandb_run is not None:
             wandb_run.log(row, step=update + 1)
         print(json.dumps(row), flush=True)
+        if (
+            not args.no_save_model
+            and args.save_every_updates > 0
+            and (update + 1) % args.save_every_updates == 0
+        ):
+            checkpoint_dir = out_dir / "checkpoints" / f"update_{update + 1:04d}"
+            policy.save(checkpoint_dir)
 
     if not args.no_save_model:
         policy.save(out_dir / "adapter")

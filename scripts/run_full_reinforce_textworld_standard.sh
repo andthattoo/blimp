@@ -20,6 +20,7 @@ HISTORY_LIMIT=${HISTORY_LIMIT:-0}
 SCORE_BATCH_SIZE=${SCORE_BATCH_SIZE:-4}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-1}
 SAVE_MODEL=${SAVE_MODEL:-1}
+SAVE_EVERY_UPDATES=${SAVE_EVERY_UPDATES:-0}
 LOG_EPISODES=${LOG_EPISODES:-0}
 WANDB_PROJECT=${WANDB_PROJECT:-}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-full-textworld-standard-qwen3-17b}
@@ -30,6 +31,9 @@ if [[ "${GRADIENT_CHECKPOINTING}" != "0" ]]; then
 fi
 if [[ "${SAVE_MODEL}" == "0" ]]; then
   TRAINING_ARGS+=(--no-save-model)
+fi
+if [[ "${SAVE_EVERY_UPDATES}" != "0" ]]; then
+  TRAINING_ARGS+=(--save-every-updates "${SAVE_EVERY_UPDATES}")
 fi
 if [[ "${LOG_EPISODES}" != "0" ]]; then
   TRAINING_ARGS+=(--log-episodes)
