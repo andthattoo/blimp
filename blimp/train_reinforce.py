@@ -52,6 +52,9 @@ class Transition:
     reward: float
     done: bool
     score: float
+    next_observation: str = ""
+    score_delta: float = 0.0
+    won: bool = False
 
 
 @dataclass
@@ -324,8 +327,13 @@ class ValidActionPolicy:
         gamma: float,
         normalize_advantages: bool,
         grad_clip: float,
+        echo_weight: float,
+        score_weight: float,
+        aux_max_items: int,
+        echo_max_words: int,
     ) -> dict[str, float]:
         items: list[tuple[str, str, float]] = []
+        transitions: list[Transition] = []
         for trace in traces:
             returns: list[float] = []
             running = 0.0
@@ -335,9 +343,18 @@ class ValidActionPolicy:
             returns.reverse()
             for transition, ret in zip(trace.transitions, returns):
                 items.append((transition.prompt, transition.action, ret))
+                transitions.append(transition)
 
         if not items:
-            return {"loss": 0.0, "mean_return": 0.0, "num_items": 0.0}
+            return {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "echo_loss": 0.0,
+                "score_loss": 0.0,
+                "mean_return": 0.0,
+                "num_items": 0.0,
+                "aux_items": 0.0,
+            }
 
         returns_tensor = torch.tensor([item[2] for item in items], dtype=torch.float32)
         advantages = returns_tensor.clone()
@@ -347,12 +364,47 @@ class ValidActionPolicy:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         loss_value = 0.0
+        policy_loss_value = 0.0
+        echo_loss_value = 0.0
+        score_loss_value = 0.0
         scale = 1.0 / len(items)
         for (prompt, action, _), advantage in zip(items, advantages):
             logprob = self.completion_logprob(prompt, action_completion(action), grad=True)
             loss = -advantage.to(self.device) * logprob * scale
-            loss_value += float(loss.detach().cpu())
+            detached = float(loss.detach().cpu())
+            loss_value += detached
+            policy_loss_value += detached
             loss.backward()
+
+        aux_transitions = (
+            select_aux_transitions(transitions, aux_max_items)
+            if echo_weight > 0 or score_weight > 0
+            else []
+        )
+        aux_scale = 1.0 / max(1, len(aux_transitions))
+        for transition in aux_transitions:
+            if echo_weight > 0 and transition.next_observation:
+                prompt, target = observation_prediction_example(
+                    transition,
+                    max_words=echo_max_words,
+                )
+                logprob = self.completion_logprob(prompt, target, grad=True)
+                loss = -echo_weight * logprob * aux_scale
+                detached = float(loss.detach().cpu())
+                loss_value += detached
+                echo_loss_value += detached
+                loss.backward()
+            if score_weight > 0:
+                prompt, target = score_prediction_example(
+                    transition,
+                    max_observation_words=echo_max_words,
+                )
+                logprob = self.completion_logprob(prompt, target, grad=True)
+                loss = -score_weight * logprob * aux_scale
+                detached = float(loss.detach().cpu())
+                loss_value += detached
+                score_loss_value += detached
+                loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad],
@@ -361,8 +413,12 @@ class ValidActionPolicy:
         self.optimizer.step()
         return {
             "loss": loss_value,
+            "policy_loss": policy_loss_value,
+            "echo_loss": echo_loss_value,
+            "score_loss": score_loss_value,
             "mean_return": float(returns_tensor.mean()),
             "num_items": float(len(items)),
+            "aux_items": float(len(aux_transitions)),
         }
 
     def save(self, path: Path) -> None:
@@ -373,6 +429,50 @@ class ValidActionPolicy:
 
 def action_completion(action: str) -> str:
     return f"ACTION: {action}"
+
+
+def select_aux_transitions(
+    transitions: list[Transition],
+    max_items: int,
+) -> list[Transition]:
+    if max_items <= 0 or len(transitions) <= max_items:
+        return transitions
+    if max_items == 1:
+        return [transitions[-1]]
+    last = len(transitions) - 1
+    indexes = sorted({round(i * last / (max_items - 1)) for i in range(max_items)})
+    return [transitions[index] for index in indexes]
+
+
+def observation_prediction_example(
+    transition: Transition,
+    *,
+    max_words: int,
+) -> tuple[str, str]:
+    observation = truncate_words(transition.next_observation, max_words)
+    prompt = f"{transition.prompt}\n{action_completion(transition.action)}\nOBSERVATION:\n"
+    return prompt, observation.strip()
+
+
+def score_prediction_example(
+    transition: Transition,
+    *,
+    max_observation_words: int,
+) -> tuple[str, str]:
+    observation = truncate_words(transition.next_observation, max_observation_words)
+    prompt = (
+        f"{transition.prompt}\n"
+        f"{action_completion(transition.action)}\n"
+        f"OBSERVATION:\n{observation.strip()}\n"
+        "PROGRESS:\n"
+    )
+    target = (
+        f"score_delta: {transition.score_delta:g}\n"
+        f"score: {transition.score:g}\n"
+        f"done: {str(transition.done).lower()}\n"
+        f"won: {str(transition.won).lower()}"
+    )
+    return prompt, target
 
 
 def run_episode(
@@ -440,6 +540,9 @@ def run_episode(
                 reward=reward,
                 done=result.done,
                 score=score,
+                next_observation=result.observation,
+                score_delta=float(result.info.get("score_delta", result.reward)),
+                won=step_success,
             )
         )
         actions.append(action)
@@ -636,6 +739,20 @@ def main() -> None:
     parser.add_argument("--epsilon", type=float, default=0.15)
     parser.add_argument("--gamma", type=float, default=0.97)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--echo-weight", type=float, default=0.0)
+    parser.add_argument("--score-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--aux-max-items",
+        type=int,
+        default=0,
+        help="Maximum transitions per update used for auxiliary ECHO/score losses. Use 0 for all.",
+    )
+    parser.add_argument(
+        "--echo-max-words",
+        type=int,
+        default=220,
+        help="Word cap for next-observation targets in auxiliary losses.",
+    )
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
@@ -817,6 +934,10 @@ def main() -> None:
             gamma=args.gamma,
             normalize_advantages=not args.no_normalize_advantages,
             grad_clip=args.grad_clip,
+            echo_weight=args.echo_weight,
+            score_weight=args.score_weight,
+            aux_max_items=args.aux_max_items,
+            echo_max_words=args.echo_max_words,
         )
         row = {
             "phase": "train",
