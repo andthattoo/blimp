@@ -159,6 +159,39 @@ uv run --active python -u -m blimp.train_reinforce \
 
 If the BLiMP run does not beat short-history no-memory, the memory channel is not carrying useful state yet.
 
+To run all three MiniGrid evals in one process, use:
+
+```bash
+VENV_PATH=/home/ubuntu/.venvs/blimp \
+scripts/run_minigrid_memory_evals.sh
+```
+
+For a single systemd-managed run on a GPU box:
+
+```bash
+mkdir -p ~/.config/systemd/user
+
+cat > ~/.config/systemd/user/blimp-minigrid-evals.service <<'EOF'
+[Unit]
+Description=BLiMP MiniGrid memory ablation evals
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/blimp
+Environment=VENV_PATH=/home/ubuntu/.venvs/blimp
+ExecStart=/home/ubuntu/blimp/scripts/run_minigrid_memory_evals.sh
+Restart=no
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user start blimp-minigrid-evals.service
+journalctl --user -u blimp-minigrid-evals.service -o cat -f
+```
+
 ## Generate TextWorld Data
 
 The q8 pilot uses procedural TextWorld games with longer quests:
