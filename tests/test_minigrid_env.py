@@ -29,6 +29,7 @@ class MiniGridTextEnvTest(unittest.TestCase):
         self.assertIn("Mission:", obs)
         self.assertIn("Local egocentric view", obs)
         self.assertIn("move forward", env.valid_actions())
+        self.assertNotIn("done", env.valid_actions())
 
         result = env.step("turn left")
         self.assertTrue(result.info["valid"])

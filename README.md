@@ -105,7 +105,7 @@ Memory is only helping if the BLiMP run beats the short-history no-memory run an
 
 ## MiniGrid Memory Tasks
 
-MiniGrid gives known partially observable memory and navigation tasks without Terminal-Bench's shell/tooling noise. The wrapper exposes the mission, facing direction, carried object, and local egocentric view as text. It does not reveal coordinates or the full map.
+MiniGrid gives known partially observable memory and navigation tasks without Terminal-Bench's shell/tooling noise. The wrapper exposes the mission, facing direction, carried object, and local egocentric view as text. It does not reveal coordinates or the full map. It hides MiniGrid's raw `done` action for these navigation-memory evals because `done` is a no-op before success and can dominate action scoring.
 
 Start with `MiniGrid-MemoryS17Random-v0`:
 

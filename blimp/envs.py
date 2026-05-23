@@ -573,7 +573,6 @@ class MiniGridTextEnv:
         "pick up": "pickup",
         "drop": "drop",
         "toggle": "toggle",
-        "done": "done",
     }
 
     def __init__(self, env_id: str | Path | None = None) -> None:
