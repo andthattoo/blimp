@@ -297,6 +297,28 @@ short block + memory
 
 If memory cannot improve over short-history no-memory here, moving to Terminal-Bench, R2E-Gym, or raw ScienceWorld will not clarify the mechanism. Those environments are useful later, but only after the state channel is known to carry reward-relevant information.
 
+## MiniGrid Bridge
+
+MiniGrid is the next benchmark after `recall`. It is partially observable, well known, and cheap enough for repeated ablations. The repo's `--env minigrid` wrapper turns the local egocentric grid into text while hiding absolute coordinates and the full map.
+
+The first MiniGrid task should be:
+
+```text
+MiniGrid-MemoryS17Random-v0
+```
+
+Run the same mechanism table:
+
+```text
+A. full history, no memory
+B. short history, no memory
+C. short blocks + generated memory
+D. short blocks + trainable memory writes
+E. corrupted memory
+```
+
+Only move to Terminal-Bench or R2E-Gym after MiniGrid shows that memory beats short-history no-memory. Otherwise those larger benchmarks will hide the failure mode behind tooling and task variance.
+
 ## Known Risks
 
 - Structured generation changes the policy interface and can break comparability with valid-action scoring.

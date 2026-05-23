@@ -16,7 +16,7 @@ See [METHOD.md](METHOD.md) for the current method note.
 
 ```text
 blimp/train_reinforce.py          online REINFORCE trainer and auxiliary losses
-blimp/envs.py                     tiny, hard, recall, TextWorld, and ScienceWorld wrappers
+blimp/envs.py                     tiny, hard, recall, MiniGrid, TextWorld, and ScienceWorld wrappers
 blimp/sglang_rollout.py           SGLang branch-rollout utility
 scripts/generate_textworld_custom_games.sh
 scripts/run_full_reinforce_textworld_standard.sh
@@ -43,6 +43,12 @@ uv pip install -e . -r requirements-scienceworld.txt
 ```
 
 ScienceWorld is currently a stretch environment. The raw valid-action surface is much noisier than TextWorld, so TextWorld should remain the first evidence environment.
+
+For MiniGrid memory/navigation tasks:
+
+```bash
+uv pip install -e . -r requirements-minigrid.txt
+```
 
 ## Memory Diagnostic Task
 
@@ -96,6 +102,62 @@ uv run --active python -u -m blimp.train_reinforce \
 ```
 
 Memory is only helping if the BLiMP run beats the short-history no-memory run and approaches full history.
+
+## MiniGrid Memory Tasks
+
+MiniGrid gives known partially observable memory and navigation tasks without Terminal-Bench's shell/tooling noise. The wrapper exposes the mission, facing direction, carried object, and local egocentric view as text. It does not reveal coordinates or the full map.
+
+Start with `MiniGrid-MemoryS17Random-v0`:
+
+```bash
+# Full history control.
+uv run --active python -u -m blimp.train_reinforce \
+  --model Qwen/Qwen3-1.7B \
+  --env minigrid \
+  --game-file MiniGrid-MemoryS17Random-v0 \
+  --mode standard \
+  --lora-rank 0 \
+  --updates 0 \
+  --eval-episodes 32 \
+  --max-steps 120 \
+  --history-limit 0 \
+  --score-batch-size 8 \
+  --no-save-model \
+  --out runs/eval-minigrid-memory-full-history
+
+# Short history, no memory.
+uv run --active python -u -m blimp.train_reinforce \
+  --model Qwen/Qwen3-1.7B \
+  --env minigrid \
+  --game-file MiniGrid-MemoryS17Random-v0 \
+  --mode standard \
+  --lora-rank 0 \
+  --updates 0 \
+  --eval-episodes 32 \
+  --max-steps 120 \
+  --history-limit 3 \
+  --score-batch-size 8 \
+  --no-save-model \
+  --out runs/eval-minigrid-memory-short-history
+
+# Short blocks with memory.
+uv run --active python -u -m blimp.train_reinforce \
+  --model Qwen/Qwen3-1.7B \
+  --env minigrid \
+  --game-file MiniGrid-MemoryS17Random-v0 \
+  --mode blimp \
+  --lora-rank 0 \
+  --updates 0 \
+  --eval-episodes 32 \
+  --max-steps 120 \
+  --block-len 3 \
+  --history-limit 3 \
+  --score-batch-size 8 \
+  --no-save-model \
+  --out runs/eval-minigrid-memory-blimp
+```
+
+If the BLiMP run does not beat short-history no-memory, the memory channel is not carrying useful state yet.
 
 ## Generate TextWorld Data
 

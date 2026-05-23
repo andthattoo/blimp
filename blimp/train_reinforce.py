@@ -1224,7 +1224,7 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument(
         "--env",
-        choices=["tiny", "hard", "recall", "textworld", "scienceworld"],
+        choices=["tiny", "hard", "recall", "minigrid", "textworld", "scienceworld"],
         default="hard",
     )
     parser.add_argument("--game-file", default=None)

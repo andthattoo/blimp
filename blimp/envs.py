@@ -558,6 +558,185 @@ class RecallPassphraseEnv:
         )
 
 
+class MiniGridTextEnv:
+    """Text adapter for partially observable MiniGrid tasks.
+
+    Coordinates and the full map are intentionally hidden. The observation is
+    the mission, the agent's facing direction, carried object, and a local
+    egocentric grid decoded into text.
+    """
+
+    ACTION_NAMES = {
+        "turn left": "left",
+        "turn right": "right",
+        "move forward": "forward",
+        "pick up": "pickup",
+        "drop": "drop",
+        "toggle": "toggle",
+        "done": "done",
+    }
+
+    def __init__(self, env_id: str | Path | None = None) -> None:
+        self.env_id = str(env_id or "MiniGrid-MemoryS17Random-v0")
+        self._env = None
+        self._actions: dict[str, int] = {}
+        self._idx_to_object: dict[int, str] = {}
+        self._idx_to_color: dict[int, str] = {}
+        self._idx_to_state: dict[int, str] = {}
+        self._last_obs: dict[str, Any] | None = None
+        self._last_info: dict[str, Any] = {}
+        self._done = False
+        self._score = 0.0
+
+    def _ensure_imports(self) -> None:
+        if self._actions:
+            return
+        try:
+            import gymnasium as gym
+            from minigrid.core.actions import Actions
+            from minigrid.core.constants import (
+                IDX_TO_COLOR,
+                IDX_TO_OBJECT,
+                IDX_TO_STATE,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "MiniGrid is not installed. Install with "
+                "`pip install -r requirements-minigrid.txt`."
+            ) from exc
+
+        self._gym = gym
+        self._actions = {
+            name: int(getattr(Actions, action_name))
+            for name, action_name in self.ACTION_NAMES.items()
+        }
+        self._idx_to_object = dict(IDX_TO_OBJECT)
+        self._idx_to_color = dict(IDX_TO_COLOR)
+        self._idx_to_state = dict(IDX_TO_STATE)
+
+    def reset(self, seed: int | None = None) -> str:
+        self._ensure_imports()
+        if self._env is None:
+            self._env = self._gym.make(self.env_id)
+        obs, info = self._env.reset(seed=seed)
+        self._last_obs = obs
+        self._last_info = dict(info or {})
+        self._done = False
+        self._score = 0.0
+        return self._feedback("New episode.")
+
+    def valid_actions(self) -> list[str]:
+        if self._done:
+            return []
+        return list(self.ACTION_NAMES.keys())
+
+    def step(self, action: str) -> StepResult:
+        if self._env is None:
+            raise RuntimeError("MiniGrid environment must be reset before stepping.")
+        normalized = " ".join(action.lower().strip().split())
+        valid = normalized in self._actions
+        if not valid:
+            return StepResult(
+                observation=self._feedback(f"`{action}` is not a MiniGrid action."),
+                reward=-0.05,
+                done=False,
+                info=self._info(valid=False, won=False, raw_reward=-0.05),
+            )
+
+        obs, reward, terminated, truncated, info = self._env.step(
+            self._actions[normalized]
+        )
+        self._last_obs = obs
+        self._last_info = dict(info or {})
+        self._done = bool(terminated or truncated)
+        won = bool(terminated and reward > 0)
+        self._score = 1.0 if won else 0.0
+        message = f"Action `{normalized}` returned reward {float(reward):g}."
+        if won:
+            message += " The task is solved."
+        elif truncated:
+            message += " The episode hit the time limit."
+        return StepResult(
+            observation=self._feedback(message),
+            reward=float(reward),
+            done=self._done,
+            info=self._info(valid=True, won=won, raw_reward=float(reward)),
+        )
+
+    def _info(self, *, valid: bool, won: bool, raw_reward: float) -> dict[str, Any]:
+        return {
+            "score": self._score,
+            "max_score": 1.0,
+            "valid": valid,
+            "won": won,
+            "raw_reward": raw_reward,
+            **self._last_info,
+        }
+
+    def _feedback(self, message: str) -> str:
+        obs = self._last_obs or {}
+        mission = str(obs.get("mission", "") or "")
+        direction = self._direction_name()
+        carrying = self._carrying_name()
+        rows = self._view_rows(obs.get("image"))
+        parts = [
+            f"Task: {self.env_id}",
+            f"Mission: {mission}" if mission else "",
+            message,
+            f"Facing: {direction}.",
+            f"Carrying: {carrying}.",
+            "Local egocentric view. Row 0 is farthest ahead; the last row is closest.",
+            *rows,
+            f"Score: {self._score}/1",
+        ]
+        return "\n".join(part for part in parts if part).strip()
+
+    def _direction_name(self) -> str:
+        if self._env is None:
+            return "unknown"
+        direction = int(getattr(self._env.unwrapped, "agent_dir", -1))
+        return {
+            0: "east",
+            1: "south",
+            2: "west",
+            3: "north",
+        }.get(direction, "unknown")
+
+    def _carrying_name(self) -> str:
+        if self._env is None:
+            return "nothing"
+        carrying = getattr(self._env.unwrapped, "carrying", None)
+        if carrying is None:
+            return "nothing"
+        color = getattr(carrying, "color", None)
+        obj_type = getattr(carrying, "type", None)
+        return " ".join(part for part in [color, obj_type] if part) or "object"
+
+    def _view_rows(self, image: Any) -> list[str]:
+        if image is None:
+            return ["View: unavailable."]
+        rows: list[str] = []
+        height = int(image.shape[1]) if hasattr(image, "shape") else len(image[0])
+        width = int(image.shape[0]) if hasattr(image, "shape") else len(image)
+        for y in range(height):
+            cells = [self._cell_name(image[x][y]) for x in range(width)]
+            rows.append(f"View row {y}: " + " | ".join(cells))
+        return rows
+
+    def _cell_name(self, cell: Any) -> str:
+        obj_idx, color_idx, state_idx = (int(cell[0]), int(cell[1]), int(cell[2]))
+        obj = self._idx_to_object.get(obj_idx, f"object-{obj_idx}")
+        if obj in {"empty", "unseen"}:
+            return obj
+        color = self._idx_to_color.get(color_idx, "")
+        state = self._idx_to_state.get(state_idx, "")
+        if obj == "door" and state:
+            return f"{color} door ({state})".strip()
+        if obj in {"wall", "floor", "goal", "lava"}:
+            return obj
+        return " ".join(part for part in [color, obj] if part).strip() or obj
+
+
 class TextWorldEnv:
     """Thin adapter for a TextWorld game file.
 
@@ -823,6 +1002,8 @@ def make_env(env_name: str, game_file: str | None = None) -> TextEnv:
         return HardQuestEnv()
     if env_name == "recall":
         return RecallPassphraseEnv()
+    if env_name == "minigrid":
+        return MiniGridTextEnv(game_file)
     if env_name == "textworld":
         if not game_file:
             raise ValueError("--game-file is required when --env textworld")

@@ -1,0 +1,2 @@
+-r requirements-train.txt
+minigrid>=3.0.0
