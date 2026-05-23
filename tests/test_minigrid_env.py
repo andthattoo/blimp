@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 
-from blimp.envs import make_env
+from blimp.envs import MiniGridTextEnv, make_env
 
 
 class MiniGridTextEnvTest(unittest.TestCase):
+    def test_constant_mapping_falls_back_to_forward_map(self) -> None:
+        module = SimpleNamespace(STATE_TO_IDX={"open": 0, "closed": 1, "locked": 2})
+
+        self.assertEqual(
+            MiniGridTextEnv._idx_mapping(
+                module, idx_name="IDX_TO_STATE", forward_name="STATE_TO_IDX"
+            ),
+            {0: "open", 1: "closed", 2: "locked"},
+        )
+
     def test_minigrid_wrapper_smoke(self) -> None:
         try:
             env = make_env("minigrid", "MiniGrid-MemoryS7-v0")

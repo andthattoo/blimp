@@ -594,11 +594,7 @@ class MiniGridTextEnv:
         try:
             import gymnasium as gym
             from minigrid.core.actions import Actions
-            from minigrid.core.constants import (
-                IDX_TO_COLOR,
-                IDX_TO_OBJECT,
-                IDX_TO_STATE,
-            )
+            from minigrid.core import constants as minigrid_constants
         except ImportError as exc:
             raise RuntimeError(
                 "MiniGrid is not installed. Install with "
@@ -610,9 +606,27 @@ class MiniGridTextEnv:
             name: int(getattr(Actions, action_name))
             for name, action_name in self.ACTION_NAMES.items()
         }
-        self._idx_to_object = dict(IDX_TO_OBJECT)
-        self._idx_to_color = dict(IDX_TO_COLOR)
-        self._idx_to_state = dict(IDX_TO_STATE)
+        self._idx_to_object = self._idx_mapping(
+            minigrid_constants, idx_name="IDX_TO_OBJECT", forward_name="OBJECT_TO_IDX"
+        )
+        self._idx_to_color = self._idx_mapping(
+            minigrid_constants, idx_name="IDX_TO_COLOR", forward_name="COLOR_TO_IDX"
+        )
+        self._idx_to_state = self._idx_mapping(
+            minigrid_constants, idx_name="IDX_TO_STATE", forward_name="STATE_TO_IDX"
+        )
+
+    @staticmethod
+    def _idx_mapping(module: Any, *, idx_name: str, forward_name: str) -> dict[int, str]:
+        idx_mapping = getattr(module, idx_name, None)
+        if idx_mapping is not None:
+            return {int(k): str(v) for k, v in dict(idx_mapping).items()}
+        forward_mapping = getattr(module, forward_name, None)
+        if forward_mapping is not None:
+            return {int(v): str(k) for k, v in dict(forward_mapping).items()}
+        raise RuntimeError(
+            f"MiniGrid constants are missing both {idx_name} and {forward_name}."
+        )
 
     def reset(self, seed: int | None = None) -> str:
         self._ensure_imports()
