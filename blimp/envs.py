@@ -445,6 +445,119 @@ class HardQuestEnv:
         )
 
 
+class RecallPassphraseEnv:
+    """Diagnostic long-history task where memory should matter by construction.
+
+    The passphrase is shown only in the first observation. The agent must walk
+    through a sequence of bland corridor states before choosing the passphrase
+    at the final gate. Full-history prompting can recover the clue from the
+    transcript; short-history prompting needs block memory to preserve it.
+    """
+
+    PASS_OPTIONS = ["ember", "mirror", "tide", "brass", "violet", "onyx"]
+    CORRIDOR_STEPS = 12
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self, seed: int | None = None) -> str:
+        import random
+
+        rng = random.Random(seed)
+        self.passphrase = rng.choice(self.PASS_OPTIONS)
+        self.position = 0
+        self.done = False
+        self.score = 0.0
+        self.steps = 0
+        return self._observation(
+            "New episode. A brass sign says: "
+            f"remember the final passphrase `{self.passphrase}`."
+        )
+
+    def valid_actions(self) -> list[str]:
+        if self.done:
+            return []
+        actions = ["look", "inventory"]
+        if self.position < self.CORRIDOR_STEPS:
+            actions.append("go forward")
+        else:
+            actions.extend(f"say {word}" for word in self.PASS_OPTIONS)
+        return actions
+
+    def step(self, action: str) -> StepResult:
+        if self.done:
+            return StepResult(
+                observation=self._observation("The task is already complete."),
+                reward=0.0,
+                done=True,
+                info=self._info(valid=False),
+            )
+
+        self.steps += 1
+        normalized = " ".join(action.lower().strip().split())
+        valid = normalized in self.valid_actions()
+
+        if normalized == "look":
+            message = "You look around. The original sign is no longer visible."
+            reward = 0.0
+        elif normalized == "inventory":
+            message = "Inventory: empty."
+            reward = 0.0
+        elif normalized == "go forward" and self.position < self.CORRIDOR_STEPS:
+            self.position += 1
+            reward = 0.0
+            if self.position < self.CORRIDOR_STEPS:
+                message = f"You move to corridor marker {self.position}."
+            else:
+                message = "You arrive at the final speaking gate."
+        elif normalized.startswith("say ") and self.position >= self.CORRIDOR_STEPS:
+            guess = normalized.removeprefix("say ").strip()
+            self.done = True
+            if guess == self.passphrase:
+                self.score = 1.0
+                reward = 1.0
+                message = "The gate accepts the passphrase. You win."
+            else:
+                reward = -0.1
+                message = "The gate rejects the passphrase and seals shut."
+        else:
+            reward = -0.05
+            message = f"'{action}' is not useful here."
+
+        return StepResult(
+            observation=self._observation(message),
+            reward=reward,
+            done=self.done,
+            info=self._info(valid=valid),
+        )
+
+    def _info(self, *, valid: bool) -> dict[str, Any]:
+        return {
+            "score": self.score,
+            "max_score": 1.0,
+            "valid": valid,
+            "won": self.done and self.score >= 1.0,
+            "steps": self.steps,
+            "position": self.position,
+        }
+
+    def _observation(self, message: str) -> str:
+        if self.position < self.CORRIDOR_STEPS:
+            place = (
+                f"Corridor marker {self.position}/{self.CORRIDOR_STEPS}. "
+                "The walls here contain only irrelevant scratches."
+            )
+        else:
+            place = (
+                "Final gate. It asks for the passphrase from the first room. "
+                "The passphrase is not written here."
+            )
+        return (
+            "Goal: say the passphrase at the final gate.\n"
+            f"{message}\n{place}"
+        )
+
+
 class TextWorldEnv:
     """Thin adapter for a TextWorld game file.
 
@@ -708,6 +821,8 @@ def make_env(env_name: str, game_file: str | None = None) -> TextEnv:
         return TinyQuestEnv()
     if env_name == "hard":
         return HardQuestEnv()
+    if env_name == "recall":
+        return RecallPassphraseEnv()
     if env_name == "textworld":
         if not game_file:
             raise ValueError("--game-file is required when --env textworld")

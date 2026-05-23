@@ -21,6 +21,7 @@ EPSILON=${EPSILON:-0.2}
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
 ECHO_WEIGHT=${ECHO_WEIGHT:-0}
 SCORE_WEIGHT=${SCORE_WEIGHT:-0}
+MEMORY_POLICY_WEIGHT=${MEMORY_POLICY_WEIGHT:-0}
 AUX_MAX_ITEMS=${AUX_MAX_ITEMS:-0}
 ECHO_MAX_WORDS=${ECHO_MAX_WORDS:-220}
 HISTORY_LIMIT=${HISTORY_LIMIT:-16}
@@ -83,6 +84,7 @@ fi
   --learning-rate "${LEARNING_RATE}" \
   --echo-weight "${ECHO_WEIGHT}" \
   --score-weight "${SCORE_WEIGHT}" \
+  --memory-policy-weight "${MEMORY_POLICY_WEIGHT}" \
   --aux-max-items "${AUX_MAX_ITEMS}" \
   --echo-max-words "${ECHO_MAX_WORDS}" \
   "${WANDB_ARGS[@]}" \

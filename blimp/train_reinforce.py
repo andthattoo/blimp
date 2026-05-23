@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from blimp.envs import make_env
+from blimp.policies import resolve_action
 from blimp.sglang_rollout import build_action_prompt, build_memory_prompt, strip_reasoning
 
 
@@ -52,9 +54,21 @@ class Transition:
     reward: float
     done: bool
     score: float
+    observation: str = ""
+    thinking: str = ""
+    raw_completion: str = ""
+    policy_completion: str = ""
     next_observation: str = ""
     score_delta: float = 0.0
     won: bool = False
+    valid: bool = True
+
+
+@dataclass
+class MemoryWrite:
+    prompt: str
+    completion: str
+    after_step: int
 
 
 @dataclass
@@ -68,11 +82,36 @@ class EpisodeTrace:
     actions: list[str]
     memories: list[str]
     transitions: list[Transition]
+    memory_writes: list[MemoryWrite] = field(default_factory=list)
 
     def json_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["transitions"] = [asdict(t) for t in self.transitions]
+        data["memory_writes"] = [asdict(m) for m in self.memory_writes]
         return data
+
+
+@dataclass
+class ParsedThinkAction:
+    thinking: str
+    action: str
+    raw_text: str
+
+
+@dataclass
+class AuxLossExample:
+    loss_type: str
+    prompt: str
+    completion: str
+    weight: float
+
+
+@dataclass
+class BranchPreferenceExample:
+    prompt: str
+    preferred: str
+    rejected: str
+    weight: float
 
 
 class ValidActionPolicy:
@@ -234,6 +273,48 @@ class ValidActionPolicy:
         )
         return strip_reasoning(text).strip()
 
+    def generate_think_action(
+        self,
+        prompt: str,
+        valid_actions: list[str],
+        *,
+        temperature: float,
+        epsilon: float,
+        greedy: bool,
+        rng: random.Random,
+        max_new_tokens: int,
+    ) -> ParsedThinkAction:
+        if valid_actions and not greedy and rng.random() < epsilon:
+            action = rng.choice(valid_actions)
+            thinking = "Exploration sample."
+            return ParsedThinkAction(
+                thinking=thinking,
+                action=action,
+                raw_text=structured_completion(thinking, action).strip(),
+            )
+
+        self.model.eval()
+        rendered = self.render_prompt(prompt)
+        inputs = self.tokenizer(rendered, return_tensors="pt", add_special_tokens=False).to(
+            self.device
+        )
+        generate_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.tokenizer.eos_token_id,
+        }
+        if greedy:
+            generate_kwargs["do_sample"] = False
+        else:
+            generate_kwargs["do_sample"] = True
+            generate_kwargs["temperature"] = max(temperature, 1e-4)
+        with torch.no_grad():
+            output = self.model.generate(**inputs, **generate_kwargs)
+        text = self.tokenizer.decode(
+            output[0, inputs["input_ids"].shape[1] :],
+            skip_special_tokens=True,
+        )
+        return parse_think_action_response(text)
+
     def completion_logprob(self, prompt: str, completion: str, *, grad: bool) -> torch.Tensor:
         rendered = self.render_prompt(prompt)
         prompt_ids = self.tokenizer(
@@ -329,21 +410,27 @@ class ValidActionPolicy:
         grad_clip: float,
         echo_weight: float,
         score_weight: float,
+        action_good_weight: float,
+        thought_weight: float,
+        future_weight: float,
+        future_horizon: int,
+        branch_contrast_weight: float,
+        branch_contrast_jsonl: str | None,
+        memory_policy_weight: float,
         aux_max_items: int,
         echo_max_words: int,
     ) -> dict[str, float]:
         items: list[tuple[str, str, float]] = []
-        transitions: list[Transition] = []
+        memory_items: list[tuple[str, str, float]] = []
         for trace in traces:
-            returns: list[float] = []
-            running = 0.0
-            for transition in reversed(trace.transitions):
-                running = transition.reward + gamma * running
-                returns.append(running)
-            returns.reverse()
+            returns = discounted_returns(trace.transitions, gamma)
             for transition, ret in zip(trace.transitions, returns):
-                items.append((transition.prompt, transition.action, ret))
-                transitions.append(transition)
+                completion = transition.policy_completion or action_completion(
+                    transition.action
+                )
+                items.append((transition.prompt, completion, ret))
+            if memory_policy_weight > 0:
+                memory_items.extend(memory_policy_items(trace, returns))
 
         if not items:
             return {
@@ -351,15 +438,24 @@ class ValidActionPolicy:
                 "policy_loss": 0.0,
                 "echo_loss": 0.0,
                 "score_loss": 0.0,
+                "action_good_loss": 0.0,
+                "thought_loss": 0.0,
+                "future_loss": 0.0,
+                "branch_contrast_loss": 0.0,
+                "memory_policy_loss": 0.0,
                 "mean_return": 0.0,
                 "num_items": 0.0,
                 "aux_items": 0.0,
+                "branch_pairs": 0.0,
+                "memory_policy_items": 0.0,
             }
 
         returns_tensor = torch.tensor([item[2] for item in items], dtype=torch.float32)
         advantages = returns_tensor.clone()
+        return_mean = returns_tensor.mean()
+        return_std = returns_tensor.std() + 1e-6
         if normalize_advantages and len(items) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
+            advantages = (advantages - return_mean) / return_std
 
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -367,43 +463,102 @@ class ValidActionPolicy:
         policy_loss_value = 0.0
         echo_loss_value = 0.0
         score_loss_value = 0.0
+        action_good_loss_value = 0.0
+        thought_loss_value = 0.0
+        future_loss_value = 0.0
+        branch_contrast_loss_value = 0.0
+        memory_policy_loss_value = 0.0
         scale = 1.0 / len(items)
-        for (prompt, action, _), advantage in zip(items, advantages):
-            logprob = self.completion_logprob(prompt, action_completion(action), grad=True)
+        for (prompt, completion, _), advantage in zip(items, advantages):
+            logprob = self.completion_logprob(prompt, completion, grad=True)
             loss = -advantage.to(self.device) * logprob * scale
             detached = float(loss.detach().cpu())
             loss_value += detached
             policy_loss_value += detached
             loss.backward()
 
-        aux_transitions = (
-            select_aux_transitions(transitions, aux_max_items)
-            if echo_weight > 0 or score_weight > 0
+        aux_examples = compile_aux_loss_examples(
+            traces,
+            echo_weight=echo_weight,
+            score_weight=score_weight,
+            action_good_weight=action_good_weight,
+            thought_weight=thought_weight,
+            future_weight=future_weight,
+            future_horizon=future_horizon,
+            echo_max_words=echo_max_words,
+        )
+        aux_examples = select_aux_examples(aux_examples, aux_max_items)
+        aux_scale = 1.0 / max(1, len(aux_examples))
+        for example in aux_examples:
+            logprob = self.completion_logprob(
+                example.prompt,
+                example.completion,
+                grad=True,
+            )
+            loss = -example.weight * logprob * aux_scale
+            detached = float(loss.detach().cpu())
+            loss_value += detached
+            if example.loss_type == "echo":
+                echo_loss_value += detached
+            elif example.loss_type == "score":
+                score_loss_value += detached
+            elif example.loss_type == "action_good":
+                action_good_loss_value += detached
+            elif example.loss_type == "thought":
+                thought_loss_value += detached
+            elif example.loss_type == "future":
+                future_loss_value += detached
+            loss.backward()
+
+        branch_pairs = (
+            load_branch_contrast_examples(
+                Path(branch_contrast_jsonl),
+                weight=branch_contrast_weight,
+                max_pairs=aux_max_items,
+            )
+            if branch_contrast_weight > 0 and branch_contrast_jsonl
             else []
         )
-        aux_scale = 1.0 / max(1, len(aux_transitions))
-        for transition in aux_transitions:
-            if echo_weight > 0 and transition.next_observation:
-                prompt, target = observation_prediction_example(
-                    transition,
-                    max_words=echo_max_words,
-                )
-                logprob = self.completion_logprob(prompt, target, grad=True)
-                loss = -echo_weight * logprob * aux_scale
+        branch_scale = 1.0 / max(1, len(branch_pairs))
+        for pair in branch_pairs:
+            preferred_logprob = self.completion_logprob(
+                pair.prompt,
+                pair.preferred,
+                grad=True,
+            )
+            rejected_logprob = self.completion_logprob(
+                pair.prompt,
+                pair.rejected,
+                grad=True,
+            )
+            loss = (
+                -pair.weight
+                * F.logsigmoid(preferred_logprob - rejected_logprob)
+                * branch_scale
+            )
+            detached = float(loss.detach().cpu())
+            loss_value += detached
+            branch_contrast_loss_value += detached
+            loss.backward()
+
+        if memory_items:
+            memory_returns_tensor = torch.tensor(
+                [item[2] for item in memory_items],
+                dtype=torch.float32,
+            )
+            memory_advantages = memory_returns_tensor.clone()
+            if normalize_advantages and len(items) > 1:
+                memory_advantages = (memory_advantages - return_mean) / return_std
+            memory_scale = memory_policy_weight / len(memory_items)
+            for (prompt, completion, _), advantage in zip(
+                memory_items,
+                memory_advantages,
+            ):
+                logprob = self.completion_logprob(prompt, completion, grad=True)
+                loss = -advantage.to(self.device) * logprob * memory_scale
                 detached = float(loss.detach().cpu())
                 loss_value += detached
-                echo_loss_value += detached
-                loss.backward()
-            if score_weight > 0:
-                prompt, target = score_prediction_example(
-                    transition,
-                    max_observation_words=echo_max_words,
-                )
-                logprob = self.completion_logprob(prompt, target, grad=True)
-                loss = -score_weight * logprob * aux_scale
-                detached = float(loss.detach().cpu())
-                loss_value += detached
-                score_loss_value += detached
+                memory_policy_loss_value += detached
                 loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -416,9 +571,16 @@ class ValidActionPolicy:
             "policy_loss": policy_loss_value,
             "echo_loss": echo_loss_value,
             "score_loss": score_loss_value,
+            "action_good_loss": action_good_loss_value,
+            "thought_loss": thought_loss_value,
+            "future_loss": future_loss_value,
+            "branch_contrast_loss": branch_contrast_loss_value,
+            "memory_policy_loss": memory_policy_loss_value,
             "mean_return": float(returns_tensor.mean()),
             "num_items": float(len(items)),
-            "aux_items": float(len(aux_transitions)),
+            "aux_items": float(len(aux_examples)),
+            "branch_pairs": float(len(branch_pairs)),
+            "memory_policy_items": float(len(memory_items)),
         }
 
     def save(self, path: Path) -> None:
@@ -431,17 +593,66 @@ def action_completion(action: str) -> str:
     return f"ACTION: {action}"
 
 
-def select_aux_transitions(
-    transitions: list[Transition],
+def discounted_returns(transitions: list[Transition], gamma: float) -> list[float]:
+    returns: list[float] = []
+    running = 0.0
+    for transition in reversed(transitions):
+        running = transition.reward + gamma * running
+        returns.append(running)
+    returns.reverse()
+    return returns
+
+
+def memory_policy_items(
+    trace: EpisodeTrace,
+    returns: list[float],
+) -> list[tuple[str, str, float]]:
+    items: list[tuple[str, str, float]] = []
+    for write in trace.memory_writes:
+        completion = write.completion.strip()
+        if not completion:
+            continue
+        future_index = max(0, min(write.after_step, len(returns)))
+        future_return = returns[future_index] if future_index < len(returns) else 0.0
+        items.append((write.prompt, completion, future_return))
+    return items
+
+
+def structured_completion(thinking: str, action: str) -> str:
+    thinking = thinking.strip() or "No additional reasoning."
+    return f"THINK: {thinking}\nACTION: {action}"
+
+
+def parse_think_action_response(text: str) -> ParsedThinkAction:
+    cleaned = strip_reasoning(text).strip()
+    thinking = ""
+    action = ""
+    think_match = re.search(
+        r"(?ims)^\s*THINK\s*:\s*(.*?)(?=^\s*ACTION\s*:|\Z)",
+        cleaned,
+    )
+    if think_match:
+        thinking = think_match.group(1).strip()
+    action_match = re.search(r"(?im)^\s*ACTION\s*:\s*(.+)$", cleaned)
+    if action_match:
+        action = action_match.group(1).strip()
+    else:
+        nonempty = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        action = nonempty[-1].removeprefix("-").strip() if nonempty else "look"
+    return ParsedThinkAction(thinking=thinking, action=action, raw_text=cleaned)
+
+
+def select_aux_examples(
+    examples: list[AuxLossExample],
     max_items: int,
-) -> list[Transition]:
-    if max_items <= 0 or len(transitions) <= max_items:
-        return transitions
+) -> list[AuxLossExample]:
+    if max_items <= 0 or len(examples) <= max_items:
+        return examples
     if max_items == 1:
-        return [transitions[-1]]
-    last = len(transitions) - 1
+        return [examples[-1]]
+    last = len(examples) - 1
     indexes = sorted({round(i * last / (max_items - 1)) for i in range(max_items)})
-    return [transitions[index] for index in indexes]
+    return [examples[index] for index in indexes]
 
 
 def observation_prediction_example(
@@ -450,7 +661,11 @@ def observation_prediction_example(
     max_words: int,
 ) -> tuple[str, str]:
     observation = truncate_words(transition.next_observation, max_words)
-    prompt = f"{transition.prompt}\n{action_completion(transition.action)}\nOBSERVATION:\n"
+    prompt = (
+        f"{transition_context(transition, include_thinking=True)}\n"
+        f"{action_completion(transition.action)}\n"
+        "NEXT_OBSERVATION:\n"
+    )
     return prompt, observation.strip()
 
 
@@ -461,18 +676,282 @@ def score_prediction_example(
 ) -> tuple[str, str]:
     observation = truncate_words(transition.next_observation, max_observation_words)
     prompt = (
-        f"{transition.prompt}\n"
+        f"{transition_context(transition, include_thinking=True)}\n"
         f"{action_completion(transition.action)}\n"
         f"OBSERVATION:\n{observation.strip()}\n"
         "PROGRESS:\n"
     )
     target = (
+        f"valid: {str(transition.valid).lower()}\n"
         f"score_delta: {transition.score_delta:g}\n"
         f"score: {transition.score:g}\n"
         f"done: {str(transition.done).lower()}\n"
         f"won: {str(transition.won).lower()}"
     )
     return prompt, target
+
+
+def build_structured_action_prompt(
+    *,
+    observation: str,
+    valid_actions: list[str],
+    memory: str,
+    history: list[str],
+    branch_hint: str,
+    memory_enabled: bool,
+    history_limit: int | None = 16,
+) -> str:
+    base_prompt = build_action_prompt(
+        observation=observation,
+        valid_actions=valid_actions,
+        memory=memory,
+        history=history,
+        branch_hint=branch_hint,
+        memory_enabled=memory_enabled,
+        history_limit=history_limit,
+    )
+    return base_prompt.replace(
+        "ACTION: <one valid action>",
+        "THINK: <brief state and consequence reasoning>\nACTION: <one valid action>",
+    )
+
+
+def format_history_line(observation: str, thinking: str, action: str) -> str:
+    if thinking.strip():
+        return (
+            f"OBSERVATION: {observation}\n"
+            f"THINK: {thinking.strip()}\n"
+            f"ACTION: {action}"
+        )
+    return f"OBSERVATION: {observation}\nACTION: {action}"
+
+
+def transition_context(transition: Transition, *, include_thinking: bool) -> str:
+    parts = [f"OBSERVATION:\n{transition.observation.strip()}"]
+    if include_thinking and transition.thinking.strip():
+        parts.append(f"THINK:\n{transition.thinking.strip()}")
+    return "\n\n".join(parts)
+
+
+def prefix_context(trace: EpisodeTrace, index: int) -> str:
+    rows: list[str] = []
+    for i, transition in enumerate(trace.transitions[: index + 1]):
+        rows.append(f"OBS_{i}:\n{transition.observation.strip()}")
+        if i < index:
+            if transition.thinking.strip():
+                rows.append(f"THINK_{i}:\n{transition.thinking.strip()}")
+            rows.append(f"ACTION_{i}:\n{transition.action.strip()}")
+    return "\n\n".join(rows)
+
+
+def consequence_weight(trace: EpisodeTrace, transition: Transition) -> float:
+    if not transition.valid:
+        return 0.0
+    if trace.solved or transition.won:
+        return 1.0
+    if transition.score_delta > 0:
+        return 0.5
+    if transition.reward > 0:
+        return 0.5
+    return 0.0
+
+
+def action_good_example(
+    trace: EpisodeTrace,
+    index: int,
+    transition: Transition,
+) -> tuple[str, str]:
+    prompt = (
+        f"{prefix_context(trace, index)}\n\n"
+        f"THINK_{index}:\n{transition.thinking.strip() or 'No additional reasoning.'}\n\n"
+        f"ACTION_{index}:\n"
+    )
+    return prompt, transition.action.strip()
+
+
+def thought_example(
+    trace: EpisodeTrace,
+    index: int,
+    transition: Transition,
+) -> tuple[str, str]:
+    prompt = f"{prefix_context(trace, index)}\n\nTHINK_{index}:\n"
+    return prompt, transition.thinking.strip()
+
+
+def future_consistency_example(
+    trace: EpisodeTrace,
+    index: int,
+    transition: Transition,
+    *,
+    horizon: int,
+    max_words: int,
+) -> tuple[str, str] | None:
+    future_index = index + max(1, horizon)
+    if future_index >= len(trace.transitions):
+        return None
+    future = trace.transitions[future_index].observation
+    prompt = (
+        f"{prefix_context(trace, index)}\n\n"
+        f"THINK_{index}:\n{transition.thinking.strip() or 'No additional reasoning.'}\n\n"
+        f"FUTURE_OBSERVATION_{future_index}:\n"
+    )
+    return prompt, truncate_words(future, max_words)
+
+
+def compile_aux_loss_examples(
+    traces: list[EpisodeTrace],
+    *,
+    echo_weight: float,
+    score_weight: float,
+    action_good_weight: float,
+    thought_weight: float,
+    future_weight: float,
+    future_horizon: int,
+    echo_max_words: int,
+) -> list[AuxLossExample]:
+    examples: list[AuxLossExample] = []
+    for trace in traces:
+        for index, transition in enumerate(trace.transitions):
+            if echo_weight > 0 and transition.next_observation:
+                prompt, completion = observation_prediction_example(
+                    transition,
+                    max_words=echo_max_words,
+                )
+                examples.append(
+                    AuxLossExample("echo", prompt, completion, echo_weight)
+                )
+            if score_weight > 0:
+                prompt, completion = score_prediction_example(
+                    transition,
+                    max_observation_words=echo_max_words,
+                )
+                examples.append(
+                    AuxLossExample("score", prompt, completion, score_weight)
+                )
+
+            weight = consequence_weight(trace, transition)
+            if action_good_weight > 0 and weight > 0:
+                prompt, completion = action_good_example(trace, index, transition)
+                examples.append(
+                    AuxLossExample(
+                        "action_good",
+                        prompt,
+                        completion,
+                        action_good_weight * weight,
+                    )
+                )
+            if thought_weight > 0 and weight > 0 and transition.thinking.strip():
+                prompt, completion = thought_example(trace, index, transition)
+                examples.append(
+                    AuxLossExample(
+                        "thought",
+                        prompt,
+                        completion,
+                        thought_weight * weight,
+                    )
+                )
+            if future_weight > 0 and weight > 0:
+                future = future_consistency_example(
+                    trace,
+                    index,
+                    transition,
+                    horizon=future_horizon,
+                    max_words=echo_max_words,
+                )
+                if future is not None:
+                    prompt, completion = future
+                    examples.append(
+                        AuxLossExample(
+                            "future",
+                            prompt,
+                            completion,
+                            future_weight * weight,
+                        )
+                    )
+    return examples
+
+
+def node_outcome_key(node: dict[str, Any]) -> tuple[int, float, int]:
+    solved = int(bool(node.get("done", False)))
+    score = float(node.get("score", 0.0) or 0.0)
+    path_len = len(node.get("path_actions", []) or [])
+    return solved, score, -path_len
+
+
+def parse_node_step_thinking(step: dict[str, Any]) -> str:
+    raw = str(step.get("raw_response", "") or "")
+    parsed = parse_think_action_response(raw)
+    return parsed.thinking
+
+
+def node_continuation(node: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for step in node.get("steps", []) or []:
+        thinking = parse_node_step_thinking(step)
+        action = str(step.get("action", "") or "").strip()
+        if thinking:
+            parts.append(f"THINK: {thinking}")
+        parts.append(f"ACTION: {action}")
+    return "\n".join(parts).strip()
+
+
+def branch_pair_prompt(node: dict[str, Any]) -> str:
+    steps = node.get("steps", []) or []
+    first = steps[0] if steps else {}
+    memory = str(first.get("memory_before", "") or "").strip() or "empty"
+    observation = str(first.get("observation", "") or "").strip()
+    return (
+        "BRANCH PREFIX\n"
+        f"MEMORY:\n{memory}\n\n"
+        f"OBSERVATION:\n{observation}\n\n"
+        "CONTINUATION:\n"
+    )
+
+
+def load_branch_contrast_examples(
+    path: Path,
+    *,
+    weight: float,
+    max_pairs: int,
+) -> list[BranchPreferenceExample]:
+    if not path.exists():
+        return []
+    pairs: list[BranchPreferenceExample] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            by_parent: dict[str | None, list[dict[str, Any]]] = {}
+            for node in row.get("nodes", []) or []:
+                by_parent.setdefault(node.get("parent_id"), []).append(node)
+            for siblings in by_parent.values():
+                if len(siblings) < 2:
+                    continue
+                ordered = sorted(siblings, key=node_outcome_key)
+                rejected = ordered[0]
+                preferred = ordered[-1]
+                if node_outcome_key(preferred) <= node_outcome_key(rejected):
+                    continue
+                preferred_completion = node_continuation(preferred)
+                rejected_completion = node_continuation(rejected)
+                if not preferred_completion or not rejected_completion:
+                    continue
+                pairs.append(
+                    BranchPreferenceExample(
+                        prompt=branch_pair_prompt(preferred),
+                        preferred=preferred_completion,
+                        rejected=rejected_completion,
+                        weight=weight,
+                    )
+                )
+    if max_pairs <= 0 or len(pairs) <= max_pairs:
+        return pairs
+    if max_pairs == 1:
+        return [pairs[-1]]
+    last = len(pairs) - 1
+    indexes = sorted({round(i * last / (max_pairs - 1)) for i in range(max_pairs)})
+    return [pairs[index] for index in indexes]
 
 
 def run_episode(
@@ -488,6 +967,7 @@ def run_episode(
     memory_words: int,
     memory_max_tokens: int,
     history_limit: int | None,
+    structured_think_action: bool,
     temperature: float,
     epsilon: float,
     greedy: bool,
@@ -500,6 +980,7 @@ def run_episode(
     actions: list[str] = []
     memories: list[str] = []
     transitions: list[Transition] = []
+    memory_writes: list[MemoryWrite] = []
     memory = ""
     score = 0.0
     solved = False
@@ -509,23 +990,54 @@ def run_episode(
         valid_actions = env.valid_actions()
         memory_enabled = mode == "blimp"
         history = block_history if memory_enabled else full_history
-        prompt = build_action_prompt(
-            observation=observation,
-            valid_actions=valid_actions,
-            memory=memory,
-            history=history,
-            branch_hint="Training rollout: choose the action most likely to complete the task.",
-            memory_enabled=memory_enabled,
-            history_limit=history_limit,
-        )
-        action, _ = policy.choose_action(
-            prompt,
-            valid_actions,
-            temperature=temperature,
-            epsilon=epsilon,
-            greedy=greedy,
-            rng=rng,
-        )
+        branch_hint = "Training rollout: choose the action most likely to complete the task."
+        if structured_think_action:
+            prompt = build_structured_action_prompt(
+                observation=observation,
+                valid_actions=valid_actions,
+                memory=memory,
+                history=history,
+                branch_hint=branch_hint,
+                memory_enabled=memory_enabled,
+                history_limit=history_limit,
+            )
+            parsed = policy.generate_think_action(
+                prompt,
+                valid_actions,
+                temperature=temperature,
+                epsilon=epsilon,
+                greedy=greedy,
+                rng=rng,
+                max_new_tokens=memory_max_tokens,
+            )
+            resolved_action = resolve_action(parsed.action, valid_actions)
+            parsed_valid = resolved_action is not None
+            action = resolved_action or (valid_actions[0] if valid_actions else "look")
+            thinking = parsed.thinking
+            raw_completion = parsed.raw_text
+            policy_completion = raw_completion or structured_completion(thinking, action)
+        else:
+            prompt = build_action_prompt(
+                observation=observation,
+                valid_actions=valid_actions,
+                memory=memory,
+                history=history,
+                branch_hint=branch_hint,
+                memory_enabled=memory_enabled,
+                history_limit=history_limit,
+            )
+            action, _ = policy.choose_action(
+                prompt,
+                valid_actions,
+                temperature=temperature,
+                epsilon=epsilon,
+                greedy=greedy,
+                rng=rng,
+            )
+            parsed_valid = True
+            thinking = ""
+            raw_completion = action_completion(action)
+            policy_completion = action_completion(action)
         result = env.step(action)
         score = float(result.info.get("score", result.reward))
         reward = float(result.reward)
@@ -540,13 +1052,18 @@ def run_episode(
                 reward=reward,
                 done=result.done,
                 score=score,
+                observation=observation,
+                thinking=thinking,
+                raw_completion=raw_completion,
+                policy_completion=policy_completion,
                 next_observation=result.observation,
                 score_delta=float(result.info.get("score_delta", result.reward)),
                 won=step_success,
+                valid=parsed_valid and bool(result.info.get("valid", True)),
             )
         )
         actions.append(action)
-        history_line = f"OBSERVATION: {observation}\nACTION: {action}"
+        history_line = format_history_line(observation, thinking, action)
         full_history.append(history_line)
         block_history.append(history_line)
         observation = result.observation
@@ -554,7 +1071,7 @@ def run_episode(
         if result.done or solved:
             break
 
-        if memory_enabled and (t + 1) % block_len == 0:
+        if memory_enabled and (t + 1) % block_len == 0 and (t + 1) < max_steps:
             note_prompt = build_memory_prompt(
                 memory=memory,
                 history=block_history,
@@ -566,6 +1083,13 @@ def run_episode(
             if note:
                 memory = truncate_words(note, memory_words)
                 memories.append(memory)
+                memory_writes.append(
+                    MemoryWrite(
+                        prompt=note_prompt,
+                        completion=memory,
+                        after_step=len(transitions),
+                    )
+                )
             block_history = []
 
     return EpisodeTrace(
@@ -578,6 +1102,7 @@ def run_episode(
         actions=actions,
         memories=memories,
         transitions=transitions,
+        memory_writes=memory_writes,
     )
 
 
@@ -699,7 +1224,7 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument(
         "--env",
-        choices=["tiny", "hard", "textworld", "scienceworld"],
+        choices=["tiny", "hard", "recall", "textworld", "scienceworld"],
         default="hard",
     )
     parser.add_argument("--game-file", default=None)
@@ -739,13 +1264,30 @@ def main() -> None:
     parser.add_argument("--epsilon", type=float, default=0.15)
     parser.add_argument("--gamma", type=float, default=0.97)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument(
+        "--structured-think-action",
+        action="store_true",
+        help="Sample explicit THINK/ACTION completions instead of scoring only valid ACTION completions.",
+    )
     parser.add_argument("--echo-weight", type=float, default=0.0)
     parser.add_argument("--score-weight", type=float, default=0.0)
+    parser.add_argument("--action-good-weight", type=float, default=0.0)
+    parser.add_argument("--thought-weight", type=float, default=0.0)
+    parser.add_argument("--future-weight", type=float, default=0.0)
+    parser.add_argument("--future-horizon", type=int, default=2)
+    parser.add_argument("--branch-contrast-weight", type=float, default=0.0)
+    parser.add_argument("--branch-contrast-jsonl", default=None)
+    parser.add_argument(
+        "--memory-policy-weight",
+        type=float,
+        default=0.0,
+        help="Policy-gradient weight for block-boundary memory writes.",
+    )
     parser.add_argument(
         "--aux-max-items",
         type=int,
         default=0,
-        help="Maximum transitions per update used for auxiliary ECHO/score losses. Use 0 for all.",
+        help="Maximum auxiliary examples or branch pairs per update. Use 0 for all.",
     )
     parser.add_argument(
         "--echo-max-words",
@@ -847,6 +1389,7 @@ def main() -> None:
                     memory_words=args.memory_words,
                     memory_max_tokens=args.memory_max_tokens,
                     history_limit=args.history_limit,
+                    structured_think_action=args.structured_think_action,
                     temperature=1.0,
                     epsilon=0.0,
                     greedy=True,
@@ -904,6 +1447,7 @@ def main() -> None:
                 memory_words=args.memory_words,
                 memory_max_tokens=args.memory_max_tokens,
                 history_limit=args.history_limit,
+                structured_think_action=args.structured_think_action,
                 temperature=args.temperature,
                 epsilon=args.epsilon,
                 greedy=False,
@@ -936,6 +1480,13 @@ def main() -> None:
             grad_clip=args.grad_clip,
             echo_weight=args.echo_weight,
             score_weight=args.score_weight,
+            action_good_weight=args.action_good_weight,
+            thought_weight=args.thought_weight,
+            future_weight=args.future_weight,
+            future_horizon=args.future_horizon,
+            branch_contrast_weight=args.branch_contrast_weight,
+            branch_contrast_jsonl=args.branch_contrast_jsonl,
+            memory_policy_weight=args.memory_policy_weight,
             aux_max_items=args.aux_max_items,
             echo_max_words=args.echo_max_words,
         )

@@ -11,7 +11,7 @@ from blimp.rollout import Variant, run_variant, summarize_runs, write_jsonl, wri
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run BLiMP A-D rollout ablations.")
-    parser.add_argument("--env", choices=["tiny", "hard", "textworld"], default="tiny")
+    parser.add_argument("--env", choices=["tiny", "hard", "recall", "textworld"], default="tiny")
     parser.add_argument("--game-file", default=None, help="TextWorld game file.")
     parser.add_argument("--game-dir", default=None, help="Directory of TextWorld .ulx/.z8 games.")
     parser.add_argument(

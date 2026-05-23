@@ -1,175 +1,386 @@
 # BLiMP
 
-Branch-Local Memory Planning for short-context, long-horizon reinforcement learning.
+BLiMP is an experimental training stack for GPU-poor, long-horizon reinforcement learning in text environments. The current method trains a causal language model with online policy-gradient updates plus token-native auxiliary losses compiled from the same trajectories.
 
-BLiMP studies whether an agent can learn long-horizon behavior under tight context and compute budgets by splitting interaction into short blocks, branching from compact memory snapshots, and assigning terminal reward only to the shortest successful root-to-leaf path.
+The short version:
+
+- Use TextWorld first because it is cheap, procedural, and has exact rewards.
+- Compare full-history RL against short block-context RL.
+- Add ECHO-style next-observation prediction and score-progress prediction.
+- Optionally add structured `THINK:/ACTION:` rollouts, future-consistency loss, and branch-contrast loss.
+- Keep the method causal-LM native: no extra architecture is required.
 
 See [METHOD.md](METHOD.md) for the current method note.
 
-## Ablation
-
-The current harness runs the four submission-critical variants:
+## Repository Map
 
 ```text
-A. 40-step flat rollout, no memory
-B. 8 x 5-step chain, memory, no branching
-C. 5-step blocks, branching, branch-local memory
-D. 5-step blocks, branching, shuffled or corrupted memory
+blimp/train_reinforce.py          online REINFORCE trainer and auxiliary losses
+blimp/envs.py                     tiny, hard, recall, TextWorld, and ScienceWorld wrappers
+blimp/sglang_rollout.py           SGLang branch-rollout utility
+scripts/generate_textworld_custom_games.sh
+scripts/run_full_reinforce_textworld_standard.sh
+scripts/run_full_reinforce_textworld_blimp.sh
 ```
 
-For branching variants, the output reports both the solved root-to-leaf horizon and total branch-expanded environment actions. Do not compare C/D to A/B without this compute accounting.
+## Setup
 
-## Quick Smoke Test
-
-The built-in `tiny` environment is only for validating basic rollout mechanics before running TextWorld or Minecraft-style tasks. The `hard` environment is a deterministic local stress test with a passphrase clue, tool chain, locked gate, moon lock, and final memory-dependent vault action.
+On a GPU machine, `uv` is the least painful path:
 
 ```bash
-python -m blimp.run_experiment \
-  --env tiny \
-  --policy scripted-tiny \
-  --episodes 3 \
-  --variants A,B,C,D \
-  --out runs/tiny-smoke
+cd ~/blimp
+uv venv --python 3.10 .venv
+source .venv/bin/activate
+uv pip install --upgrade pip setuptools wheel
+uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+uv pip install -e . -r requirements-textworld.txt
 ```
 
-Harder local memory smoke:
+For ScienceWorld experiments:
 
 ```bash
-python -m blimp.run_experiment \
-  --env hard \
-  --policy scripted-hard \
-  --episodes 1 \
-  --variants A,B,C,D \
-  --flat-steps 60 \
-  --chain-blocks 8 \
-  --branch-factor 2 \
-  --branch-depth 8 \
-  --branch-action-budget 120 \
-  --memory-words 240 \
-  --out runs/hard-smoke
+uv pip install -e . -r requirements-scienceworld.txt
 ```
 
-Outputs:
+ScienceWorld is currently a stretch environment. The raw valid-action surface is much noisier than TextWorld, so TextWorld should remain the first evidence environment.
 
-- `runs/<name>/trajectories.jsonl`
-- `runs/<name>/summary.json`
-- `runs/<name>/summary.csv`
+## Memory Diagnostic Task
 
-Optional plot:
+`--env recall` is a controlled memory task. The first observation contains a passphrase, then the agent walks through a long corridor, and the final gate asks for that passphrase. Full history should help by construction; short history without memory should lose the clue.
+
+Run these three controls before spending GPU time on larger environments:
 
 ```bash
-python scripts/plot_results.py runs/tiny-smoke
-```
-
-## Small HF Model Run
-
-On a GPU machine:
-
-```bash
-pip install -e .
-pip install -r requirements-gpu.txt
-
-MODEL=Qwen/Qwen2.5-1.5B-Instruct OUT=runs/hf-tiny scripts/run_hf_tiny.sh
-```
-
-## SGLang BLiMP Rollouts
-
-The SGLang runner uses branch-local "dead man's notes." In `standard` mode the
-model gets the full trajectory transcript and no external memory. In `blimp`
-mode the model expands 5-step blocks in a tree. At the end of each unfinished
-block, it gets a user-style memory-boundary prompt:
-
-```text
-You are about to lose the transcript.
-Write anything that would help your next self continue from scratch.
-```
-
-The resulting free-form Markdown note is copied only to child continuations of
-that branch, not to sibling branches. Qwen3 thinking is disabled by default for
-these action/note calls so the token budget is spent on the required action or
-state note rather than hidden deliberation.
-
-Start an SGLang server:
-
-```bash
-python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-1.7B \
-  --host 127.0.0.1 \
-  --port 30000 \
-  --context-length 32768
-```
-
-Run the hard local task through the SGLang server:
-
-```bash
-MODEL=Qwen/Qwen3-1.7B OUT=runs/sglang-hard-qwen3-17b-smoke \
-  scripts/run_sglang_hard_smoke.sh
-```
-
-Or start the server and run the same smoke in one process:
-
-```bash
-MODEL=Qwen/Qwen3-1.7B OUT=runs/sglang-hard-qwen3-17b-smoke \
-  scripts/run_sglang_server_hard_smoke.sh
-```
-
-For a CPU-only wiring smoke without SGLang:
-
-```bash
-python -m blimp.sglang_rollout \
-  --mock-policy scripted-hard \
-  --env hard \
-  --episodes 1 \
-  --modes standard,blimp \
-  --out runs/sglang-mock-hard-smoke
-```
-
-## First Training Loop
-
-The initial training script is an online REINFORCE loop over the environment's
-valid actions with a LoRA adapter. It uses reward from the environment rather
-than oracle traces. In `blimp` mode, the model still writes a free-form
-dead-man note at each block boundary; the policy-gradient update is applied to
-the selected actions.
-
-```bash
-pip install -e .
-pip install -r requirements-train.txt
-
-python -m blimp.train_reinforce \
+# Full history: should recover the first-room clue from transcript.
+uv run --active python -u -m blimp.train_reinforce \
   --model Qwen/Qwen3-1.7B \
-  --env hard \
+  --env recall \
+  --mode standard \
+  --lora-rank 0 \
+  --updates 0 \
+  --eval-episodes 32 \
+  --max-steps 20 \
+  --history-limit 0 \
+  --score-batch-size 16 \
+  --no-save-model \
+  --out runs/eval-recall-full-history
+
+# Short history, no memory: should lose the first-room clue.
+uv run --active python -u -m blimp.train_reinforce \
+  --model Qwen/Qwen3-1.7B \
+  --env recall \
+  --mode standard \
+  --lora-rank 0 \
+  --updates 0 \
+  --eval-episodes 32 \
+  --max-steps 20 \
+  --history-limit 3 \
+  --score-batch-size 16 \
+  --no-save-model \
+  --out runs/eval-recall-short-history
+
+# Short blocks with memory: this is the memory mechanism test.
+uv run --active python -u -m blimp.train_reinforce \
+  --model Qwen/Qwen3-1.7B \
+  --env recall \
   --mode blimp \
-  --updates 20 \
-  --episodes-per-update 2 \
-  --eval-every 5 \
-  --out runs/reinforce-hard-qwen3-17b
+  --lora-rank 0 \
+  --updates 0 \
+  --eval-episodes 32 \
+  --max-steps 20 \
+  --block-len 3 \
+  --history-limit 3 \
+  --score-batch-size 16 \
+  --no-save-model \
+  --out runs/eval-recall-blimp-memory
 ```
 
-For real TextWorld games, install TextWorld and pass either `--game-file` or `--game-dir`:
+Memory is only helping if the BLiMP run beats the short-history no-memory run and approaches full history.
+
+## Generate TextWorld Data
+
+The q8 pilot uses procedural TextWorld games with longer quests:
 
 ```bash
-pip install textworld
+TRAIN_N=2048 \
+EVAL_N=256 \
+WORLD_SIZE=6 \
+NB_OBJECTS=12 \
+QUEST_LENGTH=8 \
+OUT=data/textworld-custom-q8 \
+scripts/generate_textworld_custom_games.sh
+```
 
-python -m blimp.run_experiment \
+The train split is written to:
+
+```text
+data/textworld-custom-q8/train
+```
+
+The held-out eval split is written to:
+
+```text
+data/textworld-custom-q8/eval
+```
+
+## Baseline: Standard Full-History RL
+
+This is the flat baseline. It uses full history by default in the launcher below and does not use block state.
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+GAME_DIR=data/textworld-custom-q8/train \
+EVAL_GAME_DIR=data/textworld-custom-q8/eval \
+OUT=runs/textworld-standard-q8 \
+UPDATES=30 \
+EPISODES_PER_UPDATE=4 \
+EVAL_EPISODES=2 \
+EVAL_EVERY=10 \
+EVAL_MAX_STEPS=25 \
+SKIP_INITIAL_EVAL=1 \
+MAX_STEPS=50 \
+HISTORY_LIMIT=0 \
+SCORE_BATCH_SIZE=16 \
+SAVE_MODEL=1 \
+LOG_EPISODES=1 \
+scripts/run_full_reinforce_textworld_standard.sh
+```
+
+## BLiMP: Block-Context RL
+
+This run uses short block history plus compact block state.
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+GAME_DIR=data/textworld-custom-q8/train \
+EVAL_GAME_DIR=data/textworld-custom-q8/eval \
+OUT=runs/textworld-blimp-q8 \
+UPDATES=30 \
+EPISODES_PER_UPDATE=4 \
+EVAL_EPISODES=2 \
+EVAL_EVERY=10 \
+EVAL_MAX_STEPS=25 \
+SKIP_INITIAL_EVAL=1 \
+MAX_STEPS=50 \
+BLOCK_LEN=5 \
+HISTORY_LIMIT=16 \
+SCORE_BATCH_SIZE=16 \
+SAVE_MODEL=1 \
+LOG_EPISODES=1 \
+scripts/run_full_reinforce_textworld_blimp.sh
+```
+
+## BLiMP + ECHO/Score Losses
+
+The shell launcher exposes the transition auxiliary losses used in the first pilot:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+GAME_DIR=data/textworld-custom-q8/train \
+EVAL_GAME_DIR=data/textworld-custom-q8/eval \
+OUT=runs/textworld-blimp-echo-q8 \
+UPDATES=30 \
+EPISODES_PER_UPDATE=4 \
+EVAL_EPISODES=2 \
+EVAL_EVERY=10 \
+EVAL_MAX_STEPS=25 \
+SKIP_INITIAL_EVAL=1 \
+MAX_STEPS=50 \
+BLOCK_LEN=5 \
+HISTORY_LIMIT=16 \
+SCORE_BATCH_SIZE=16 \
+ECHO_WEIGHT=0.02 \
+SCORE_WEIGHT=0.01 \
+AUX_MAX_ITEMS=24 \
+ECHO_MAX_WORDS=160 \
+SAVE_MODEL=1 \
+LOG_EPISODES=1 \
+scripts/run_full_reinforce_textworld_blimp.sh
+```
+
+## BLiMP + Trainable Memory Writes
+
+To test whether memory can become useful, train block-boundary memory as a policy output. This adds policy-gradient loss on each generated memory write, with credit assigned from rewards after that block boundary.
+
+Use short blocks first:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+GAME_DIR=data/textworld-custom-q8/train \
+EVAL_GAME_DIR=data/textworld-custom-q8/eval \
+OUT=runs/textworld-blimp-memory-policy-b3-q8 \
+UPDATES=30 \
+EPISODES_PER_UPDATE=4 \
+EVAL_EPISODES=2 \
+EVAL_EVERY=10 \
+EVAL_MAX_STEPS=25 \
+SKIP_INITIAL_EVAL=1 \
+MAX_STEPS=50 \
+BLOCK_LEN=3 \
+HISTORY_LIMIT=3 \
+SCORE_BATCH_SIZE=16 \
+MEMORY_POLICY_WEIGHT=0.1 \
+SAVE_MODEL=1 \
+LOG_EPISODES=1 \
+scripts/run_full_reinforce_textworld_blimp.sh
+```
+
+Compare this against untrained `--mode blimp` and untrained `--mode standard --history-limit 3`. Memory only counts as working if it beats short-history no-memory under the same tight context budget.
+
+## Structured Auxiliary Run
+
+The newest method knobs are available directly on `blimp.train_reinforce.py`. Use this path for the structured ablation until the shell launchers expose every flag.
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+uv run python -u -m blimp.train_reinforce \
+  --model Qwen/Qwen3-1.7B \
   --env textworld \
-  --game-dir /path/to/textworld-games \
-  --policy hf \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --episodes 50 \
-  --variants A,B,C,D \
-  --branch-factor 2 \
-  --branch-depth 8 \
-  --branch-action-budget 320 \
-  --out runs/textworld-qwen15b
+  --game-dir data/textworld-custom-q8/train \
+  --eval-game-dir data/textworld-custom-q8/eval \
+  --mode blimp \
+  --lora-rank 0 \
+  --updates 30 \
+  --episodes-per-update 4 \
+  --eval-episodes 2 \
+  --eval-every 10 \
+  --eval-max-steps 25 \
+  --skip-initial-eval \
+  --max-steps 50 \
+  --block-len 5 \
+  --history-limit 16 \
+  --score-batch-size 16 \
+  --gradient-checkpointing \
+  --temperature 1.2 \
+  --epsilon 0.2 \
+  --learning-rate 1e-6 \
+  --structured-think-action \
+  --echo-weight 0.02 \
+  --score-weight 0.01 \
+  --action-good-weight 0.02 \
+  --future-weight 0.01 \
+  --future-horizon 2 \
+  --thought-weight 0 \
+  --aux-max-items 24 \
+  --echo-max-words 160 \
+  --out runs/textworld-blimp-structured-q8
 ```
 
-## JarvisLabs Sketch
+Keep `--thought-weight 0` for the first serious run. Thought imitation is not automatically trustworthy.
 
-Use an existing running machine:
+## Branch Contrast
+
+Branch contrast requires branch-expanded rollout JSONL:
 
 ```bash
-jl upload . <machine_id>:/home/blimp
-jl exec <machine_id> -- bash -lc 'cd /home/blimp && pip install -e . && pip install -r requirements-gpu.txt'
-jl exec <machine_id> -- bash -lc 'cd /home/blimp && MODEL=Qwen/Qwen2.5-1.5B-Instruct OUT=runs/hf-tiny scripts/run_hf_tiny.sh'
+uv run python -u -m blimp.train_reinforce \
+  --model Qwen/Qwen3-1.7B \
+  --env textworld \
+  --game-dir data/textworld-custom-q8/train \
+  --eval-game-dir data/textworld-custom-q8/eval \
+  --mode blimp \
+  --lora-rank 0 \
+  --branch-contrast-jsonl runs/branch-rollouts/results.jsonl \
+  --branch-contrast-weight 0.01 \
+  --aux-max-items 24 \
+  --out runs/textworld-blimp-branch-contrast-q8
 ```
+
+Do not enable this loss unless the JSONL contains real sibling branches from the same prefix. Randomly mixing unrelated trajectories would make the preference labels meaningless.
+
+## Evaluation
+
+Saved checkpoints can be evaluated by loading the checkpoint path or Hugging Face repo as `MODEL` and setting `UPDATES=0`:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+MODEL=andthattoo/blimp-textworld-blimp-q8 \
+GAME_DIR=data/textworld-custom-q8/train \
+EVAL_GAME_DIR=data/textworld-custom-q8/eval \
+OUT=runs/eval-blimp-q8-final-32 \
+UPDATES=0 \
+EVAL_EPISODES=32 \
+EVAL_EVERY=1 \
+MAX_STEPS=50 \
+HISTORY_LIMIT=16 \
+SCORE_BATCH_SIZE=16 \
+SAVE_MODEL=0 \
+LOG_EPISODES=1 \
+scripts/run_full_reinforce_textworld_blimp.sh
+```
+
+Use the standard launcher for standard checkpoints:
+
+```bash
+MODEL=andthattoo/blimp-textworld-standard-q8 \
+OUT=runs/eval-standard-q8-final-32 \
+UPDATES=0 \
+EVAL_EPISODES=32 \
+SAVE_MODEL=0 \
+scripts/run_full_reinforce_textworld_standard.sh
+```
+
+## Pilot TextWorld Results
+
+Held-out TextWorld q8 eval, 32 episodes, max 50 steps, Qwen3-1.7B full-parameter checkpoints:
+
+| Run | Checkpoint | Solved | Success | Mean score | Mean reward | Mean steps | Eval wall time |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Standard full-history RL | `andthattoo/blimp-textworld-standard-q8` | 12/32 | 0.375 | 0.40625 | 0.78125 | 35.375 | 7355.4s |
+| BLiMP block RL | `andthattoo/blimp-textworld-blimp-q8` | 17/32 | 0.53125 | 0.59375 | 1.125 | 33.25 | 1531.9s |
+| BLiMP + ECHO/score | `andthattoo/blimp-textworld-blimp-echo-q8` | 16/32 | 0.5 | 0.53125 | 1.03125 | 33.71875 | 1618.9s |
+
+Pilot takeaway: BLiMP block RL beat this standard full-history run on held-out success in this 32-episode eval and was much faster to evaluate in the current implementation. BLiMP + ECHO/score beat standard but did not beat plain BLiMP in this pilot.
+
+This is not enough for a final claim. We have not yet shown parity with a well-tuned full-history RL baseline across seeds, larger validation sets, and equalized compute budgets. The current evidence should be described as a compute-limited pilot showing a promising short-context training signal.
+
+## Current Limitations
+
+- The final eval is only 32 held-out TextWorld games.
+- There is one main seed per trained condition.
+- The full-history baseline was expensive and may be under-tuned.
+- The eval wall-time comparison reflects this implementation's valid-action scoring cost, not a universal property of the method.
+- TextWorld q8 is useful but narrow; it does not establish transfer to broader long-horizon environments.
+- BLiMP + ECHO/score did not beat plain BLiMP in the pilot, so the auxiliary losses need more ablation before being presented as an improvement.
+- We still need an untrained checkpoint eval under the exact same final eval script and reward semantics.
+
+Before making a strong paper claim, rerun with larger validation, multiple seeds, and at least one additional environment.
+
+## Outputs
+
+Training writes:
+
+```text
+runs/<name>/config.json
+runs/<name>/metrics.jsonl
+runs/<name>/train_traces.jsonl
+runs/<name>/eval_traces.jsonl
+runs/<name>/adapter
+```
+
+When `--lora-rank 0` is used, the `adapter` directory name is historical: it contains a full model checkpoint, not a LoRA adapter.
+
+## Current Critical Path
+
+For a clean paper table, run:
+
+```text
+A. standard RL
+B. BLiMP block RL
+C. BLiMP + ECHO/score
+D. BLiMP + structured action-good/future
+E. BLiMP + branch contrast, only after branch JSONL exists
+```
+
+Minimum next ablations:
+
+```text
+F. untrained Qwen3-1.7B under the exact final eval script
+G. standard RL with matched seeds and longer/full eval
+H. BLiMP across 3+ seeds
+I. BLiMP on a harder TextWorld split, such as q10 or q12
+J. one non-TextWorld environment, preferably a curated ScienceWorld subset before raw ScienceWorld
+K. trainable memory writes with block_len=3 and matched no-memory short-history control
+```
+
+Report held-out success, mean score, mean reward, mean steps, eval wall time, total environment calls, train wall time, and GPU type. Do not claim the structured or branch losses help until they beat the matching BLiMP baseline on held-out games.
