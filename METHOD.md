@@ -295,7 +295,7 @@ short block + memory
   > short history, no memory
 ```
 
-If memory cannot improve over short-history no-memory here, moving to Terminal-Bench, R2E-Gym, or raw ScienceWorld will not clarify the mechanism. Those environments are useful later, but only after the state channel is known to carry reward-relevant information.
+If memory cannot improve over short-history no-memory here, a broad Terminal-Bench, R2E-Gym, or raw ScienceWorld claim will not clarify the mechanism. Those environments are useful later, but only after the state channel is known to carry reward-relevant information.
 
 ## MiniGrid Bridge
 
@@ -317,7 +317,30 @@ D. short blocks + trainable memory writes
 E. corrupted memory
 ```
 
-Only move to Terminal-Bench or R2E-Gym after MiniGrid shows that memory beats short-history no-memory. Otherwise those larger benchmarks will hide the failure mode behind tooling and task variance.
+Do not treat MiniGrid textification as proof by itself. If full history is bloated or unstable, it is not a clean upper bound. In that case, a narrow Terminal-Bench diagnostic can be useful before broad benchmark claims, but only when the failure mode is explicitly about transcript bloat and state drift.
+
+## Terminal-Bench Blind-Maze Diagnostic
+
+`blind-maze-explorer-5x5` is now the narrow Terminal-Bench diagnostic because it exposes a concrete control failure: standard Terminus-style prompting can grow beyond a 32k model context while the model's implicit maze map drifts. That is a direct test of whether compact memory can preserve task state better than a full transcript.
+
+This is not yet evidence that BLiMP improves Terminal-Bench in general. The valid comparison is:
+
+```text
+same model
+same SGLang context length
+same task
+standard Terminus full transcript
+  vs.
+BLiMP-Terminus short transcript + durable memory
+```
+
+The first things to measure are:
+
+- Did either agent solve the task?
+- Did the standard agent fail by context overflow, ordinary wrong answer, timeout, or invalid actions?
+- Did BLiMP keep `approx_prompt_chars` and provider `prompt_tokens` bounded?
+- Did BLiMP memory remain a compact state snapshot, or did it become another transcript?
+- Did the final map match because of exploration, not because the agent read protected files?
 
 ## Known Risks
 

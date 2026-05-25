@@ -18,9 +18,11 @@ See [METHOD.md](METHOD.md) for the current method note.
 blimp/train_reinforce.py          online REINFORCE trainer and auxiliary losses
 blimp/envs.py                     tiny, hard, recall, MiniGrid, TextWorld, and ScienceWorld wrappers
 blimp/sglang_rollout.py           SGLang branch-rollout utility
+blimp/tbench_blimp_agent.py       Terminal-Bench custom agent with compact BLiMP memory
 scripts/generate_textworld_custom_games.sh
 scripts/run_full_reinforce_textworld_standard.sh
 scripts/run_full_reinforce_textworld_blimp.sh
+scripts/run_tbench_qwen35_blimp.sh
 ```
 
 ## Setup
@@ -190,6 +192,69 @@ EOF
 systemctl --user daemon-reload
 systemctl --user start blimp-minigrid-evals.service
 journalctl --user -u blimp-minigrid-evals.service -o cat -f
+```
+
+## Terminal-Bench Blind-Maze Diagnostic
+
+The current Terminal-Bench target is not a broad leaderboard run. It is a focused context-management diagnostic: `blind-maze-explorer-5x5` makes the standard Terminus-style full transcript grow until Qwen3.5-4B's 32k context limit, while the model's implicit map drifts. That is exactly the failure BLiMP should attack.
+
+The custom agent in `blimp/tbench_blimp_agent.py` implements Terminal-Bench's `BaseAgent` interface. It calls the same OpenAI-compatible SGLang server, but prompts with:
+
+- compact durable memory,
+- only a short recent terminal window,
+- JSON commands compatible with `TmuxSession`,
+- per-episode debug logs under `agent-logs/episode-*/debug.json`.
+
+Start SGLang separately, then run the BLiMP agent through the official `tb` harness:
+
+```bash
+cd ~/blimp
+
+OPENAI_API_KEY=EMPTY \
+OPENAI_API_BASE=http://127.0.0.1:30000/v1 \
+OPENAI_BASE_URL=http://127.0.0.1:30000/v1 \
+MODEL=openai/Qwen/Qwen3.5-4B \
+scripts/run_tbench_qwen35_blimp.sh blind-maze-explorer-5x5
+```
+
+For a systemd-managed run:
+
+```bash
+cd ~/blimp
+
+systemd-run --user \
+  --unit=tbench-qwen35-blimp-maze \
+  --collect \
+  --property=WorkingDirectory=/home/ubuntu/blimp \
+  --setenv=OPENAI_API_KEY=EMPTY \
+  --setenv=OPENAI_API_BASE=http://127.0.0.1:30000/v1 \
+  --setenv=OPENAI_BASE_URL=http://127.0.0.1:30000/v1 \
+  --setenv=MODEL=openai/Qwen/Qwen3.5-4B \
+  /home/ubuntu/blimp/scripts/run_tbench_qwen35_blimp.sh blind-maze-explorer-5x5
+
+journalctl --user -u tbench-qwen35-blimp-maze.service -o cat -f
+```
+
+Compare against the standard Terminus baseline at the same SGLang context length:
+
+```bash
+OPENAI_API_KEY=EMPTY \
+OPENAI_API_BASE=http://127.0.0.1:30000/v1 \
+OPENAI_BASE_URL=http://127.0.0.1:30000/v1 \
+/home/ubuntu/.local/bin/tb run \
+  --dataset terminal-bench-core==0.1.1 \
+  --agent terminus \
+  --model openai/Qwen/Qwen3.5-4B \
+  --task-id blind-maze-explorer-5x5
+```
+
+The first success criterion is not just pass/fail. Check whether BLiMP avoids context overflow and keeps prompts bounded:
+
+```bash
+RUN=/home/ubuntu/blimp/runs/latest-run-id
+
+grep -Rni "context length\|prompt_tokens\|approx_prompt_chars\|LLM HTTP" "$RUN" | head -200
+find "$RUN" -path '*/agent-logs/episode-*/debug.json' -print | tail
 ```
 
 ## Generate TextWorld Data
