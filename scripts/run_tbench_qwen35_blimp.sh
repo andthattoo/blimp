@@ -26,6 +26,7 @@ REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-120}
 COMMAND_WAIT_SEC=${COMMAND_WAIT_SEC:-0.7}
 CLEAR_TMUX_HISTORY=${CLEAR_TMUX_HISTORY:-0}
 ENABLE_THINKING=${ENABLE_THINKING:-0}
+MAZE_CONTROLLER=${MAZE_CONTROLLER:-1}
 
 if [[ $# -gt 0 ]]; then
   TASKS=("$@")
@@ -54,5 +55,6 @@ for task in "${TASKS[@]}"; do
     --agent-kwarg "request_timeout=${REQUEST_TIMEOUT}" \
     --agent-kwarg "command_wait_sec=${COMMAND_WAIT_SEC}" \
     --agent-kwarg "clear_tmux_history=${CLEAR_TMUX_HISTORY}" \
-    --agent-kwarg "enable_thinking=${ENABLE_THINKING}" || true
+    --agent-kwarg "enable_thinking=${ENABLE_THINKING}" \
+    --agent-kwarg "maze_controller=${MAZE_CONTROLLER}" || true
 done

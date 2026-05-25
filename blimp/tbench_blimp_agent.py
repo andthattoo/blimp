@@ -5,6 +5,7 @@ import os
 import re
 import urllib.error
 import urllib.request
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,15 @@ class AgentDecision:
     commands: list[CommandSpec]
     is_task_complete: bool = False
     notes: str = ""
+
+
+@dataclass
+class MazeSolveResult:
+    completed: bool
+    steps: int
+    map_text: str
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
 
 
 class LLMCallError(RuntimeError):
@@ -138,6 +148,231 @@ class OpenAICompatibleChatClient:
         )
 
 
+Coord = tuple[int, int]
+
+
+DIR_DELTA: dict[str, Coord] = {
+    "N": (0, -1),
+    "E": (1, 0),
+    "S": (0, 1),
+    "W": (-1, 0),
+}
+OPPOSITE_DIR: dict[str, str] = {"N": "S", "S": "N", "E": "W", "W": "E"}
+DIR_ORDER = ("N", "E", "S", "W")
+
+
+class BlindMazeController:
+    """Deterministic graph explorer for Terminal-Bench blind-maze tasks."""
+
+    def __init__(self, agent: "BLiMPTerminusAgent") -> None:
+        self.agent = agent
+        self.current: Coord = (0, 0)
+        self.start: Coord = (0, 0)
+        self.exit: Coord | None = None
+        self.open_cells: set[Coord] = {self.start}
+        self.wall_cells: set[Coord] = set()
+        self.edges: dict[Coord, dict[str, Coord]] = {self.start: {}}
+        self.tried: dict[Coord, set[str]] = {self.start: set()}
+        self.events: list[dict[str, Any]] = []
+        self.step_count = 0
+
+    def solve(self, *, session: Any, logging_dir: Path | None) -> MazeSolveResult:
+        start_output = self.agent._send_command(
+            session,
+            CommandSpec("./maze_game.sh\n", is_blocking=False, timeout_sec=3.0),
+        )
+        self._record("start", "./maze_game.sh", [], [], start_output)
+
+        while self.step_count < self.agent.max_episodes * self.agent.max_commands_per_episode:
+            target = self._nearest_frontier_cell()
+            if target is None:
+                break
+            if target != self.current:
+                path = self._path_between(self.current, target)
+                if not path:
+                    break
+                self._send_moves(session, path)
+                continue
+
+            direction = self._next_untried_direction(self.current)
+            if direction is None:
+                continue
+            self._send_moves(session, [direction])
+
+        map_text = self._render_map()
+        exit_output = self.agent._send_command(
+            session,
+            CommandSpec("exit\n", is_blocking=False, timeout_sec=2.0),
+        )
+        self._record("exit", "exit", [], [], exit_output)
+        write_output = self.agent._send_command(
+            session,
+            CommandSpec(write_map_command(map_text), is_blocking=False, timeout_sec=3.0),
+        )
+        self._record("write_map", "cat > /app/maze_map.txt", [], [], write_output)
+        check_output = self.agent._send_command(
+            session,
+            CommandSpec(
+                "python3 - <<'PY'\n"
+                "from pathlib import Path\n"
+                "p=Path('/app/maze_map.txt')\n"
+                "print(p.exists(), len(p.read_text().splitlines()))\n"
+                "print(p.read_text())\n"
+                "PY\n",
+                is_blocking=False,
+                timeout_sec=3.0,
+            ),
+        )
+        self._record("check_map", "python3 check", [], [], check_output)
+        self._write_debug(logging_dir, map_text)
+        return MazeSolveResult(
+            completed=True,
+            steps=self.step_count,
+            map_text=map_text,
+        )
+
+    def _send_moves(self, session: Any, directions: list[str]) -> None:
+        if not directions:
+            return
+        command = "move " + " & ".join(directions) + "\n"
+        output = self.agent._send_command(
+            session,
+            CommandSpec(command, is_blocking=False, timeout_sec=2.0),
+        )
+        responses = parse_maze_responses(output)
+        self._apply_responses(directions, responses)
+        self._record("move", command.strip(), directions, responses, output)
+        self.step_count += len(directions)
+
+    def _apply_responses(self, directions: list[str], responses: list[str]) -> None:
+        for direction, response in zip(directions, responses):
+            self.tried.setdefault(self.current, set()).add(direction)
+            nxt = add_coords(self.current, DIR_DELTA[direction])
+            if response == "hit wall":
+                if nxt not in self.open_cells:
+                    self.wall_cells.add(nxt)
+                continue
+            if response not in {"moved", "reached exit"}:
+                continue
+            src = self.current
+            self.open_cells.add(nxt)
+            self.wall_cells.discard(nxt)
+            self.edges.setdefault(src, {})[direction] = nxt
+            self.edges.setdefault(nxt, {})[OPPOSITE_DIR[direction]] = src
+            self.tried.setdefault(nxt, set()).add(OPPOSITE_DIR[direction])
+            if response == "reached exit":
+                self.exit = nxt
+            self.current = nxt
+
+    def _nearest_frontier_cell(self) -> Coord | None:
+        queue: deque[Coord] = deque([self.current])
+        seen = {self.current}
+        while queue:
+            cell = queue.popleft()
+            if self._next_untried_direction(cell) is not None:
+                return cell
+            for nxt in self.edges.get(cell, {}).values():
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append(nxt)
+        return None
+
+    def _next_untried_direction(self, cell: Coord) -> str | None:
+        tried = self.tried.setdefault(cell, set())
+        for direction in DIR_ORDER:
+            if direction not in tried:
+                return direction
+        return None
+
+    def _path_between(self, start: Coord, target: Coord) -> list[str]:
+        queue: deque[Coord] = deque([start])
+        parent: dict[Coord, tuple[Coord, str] | None] = {start: None}
+        while queue:
+            cell = queue.popleft()
+            if cell == target:
+                break
+            for direction, nxt in self.edges.get(cell, {}).items():
+                if nxt not in parent:
+                    parent[nxt] = (cell, direction)
+                    queue.append(nxt)
+        if target not in parent:
+            return []
+
+        path: list[str] = []
+        cell = target
+        while cell != start:
+            prev = parent[cell]
+            if prev is None:
+                break
+            cell, direction = prev
+            path.append(direction)
+        path.reverse()
+        return path
+
+    def _render_map(self) -> str:
+        known = self.open_cells | self.wall_cells
+        min_x = min(x for x, _ in known)
+        max_x = max(x for x, _ in known)
+        min_y = min(y for _, y in known)
+        max_y = max(y for _, y in known)
+        rows: list[str] = []
+        for y in range(min_y, max_y + 1):
+            chars: list[str] = []
+            for x in range(min_x, max_x + 1):
+                cell = (x, y)
+                if cell == self.start:
+                    chars.append("S")
+                elif cell == self.exit:
+                    chars.append("E")
+                elif cell in self.open_cells:
+                    chars.append(" ")
+                else:
+                    chars.append("#")
+            rows.append("".join(chars))
+        return "\n".join(rows) + "\n"
+
+    def _record(
+        self,
+        kind: str,
+        command: str,
+        directions: list[str],
+        responses: list[str],
+        output: str,
+    ) -> None:
+        self.events.append(
+            {
+                "kind": kind,
+                "command": command,
+                "directions": directions,
+                "responses": responses,
+                "current": self.current,
+                "open_cells": sorted(self.open_cells),
+                "wall_cells": sorted(self.wall_cells),
+                "exit": self.exit,
+                "output": output,
+            }
+        )
+
+    def _write_debug(self, logging_dir: Path | None, map_text: str) -> None:
+        if logging_dir is None:
+            return
+        debug_dir = logging_dir / "maze-controller"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "current": self.current,
+            "start": self.start,
+            "exit": self.exit,
+            "open_cells": sorted(self.open_cells),
+            "wall_cells": sorted(self.wall_cells),
+            "events": self.events,
+            "map_text": map_text,
+            "steps": self.step_count,
+        }
+        with (debug_dir / "debug.json").open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+
+
 class BLiMPTerminusAgent(BaseAgent):
     """Terminal-Bench custom agent with short transcript plus durable memory.
 
@@ -165,6 +400,7 @@ class BLiMPTerminusAgent(BaseAgent):
         command_wait_sec: float | str = 0.7,
         clear_tmux_history: bool | str = False,
         enable_thinking: bool | str = False,
+        maze_controller: bool | str = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -187,6 +423,7 @@ class BLiMPTerminusAgent(BaseAgent):
         self.command_wait_sec = float(command_wait_sec)
         self.clear_tmux_history = parse_bool(clear_tmux_history)
         self.disable_thinking = not parse_bool(enable_thinking)
+        self.maze_controller = parse_bool(maze_controller)
         self._timestamped_markers: list[tuple[float, str]] = []
 
     def perform_task(
@@ -198,6 +435,8 @@ class BLiMPTerminusAgent(BaseAgent):
         logging_dir = Path(logging_dir) if logging_dir is not None else None
         if logging_dir is not None:
             logging_dir.mkdir(parents=True, exist_ok=True)
+        if self.maze_controller and "blind maze" in instruction.lower():
+            return self._perform_blind_maze_task(instruction, session, logging_dir)
 
         client = OpenAICompatibleChatClient(
             api_base=self.api_base,
@@ -330,6 +569,21 @@ class BLiMPTerminusAgent(BaseAgent):
             total_input_tokens,
             total_output_tokens,
             failure_name="NONE",
+            markers=self._timestamped_markers,
+        )
+
+    def _perform_blind_maze_task(
+        self,
+        instruction: str,
+        session: Any,
+        logging_dir: Path | None,
+    ) -> AgentResult:
+        controller = BlindMazeController(self)
+        result = controller.solve(session=session, logging_dir=logging_dir)
+        return make_agent_result(
+            result.total_input_tokens,
+            result.total_output_tokens,
+            failure_name="NONE" if result.completed else "UNKNOWN",
             markers=self._timestamped_markers,
         )
 
@@ -534,6 +788,24 @@ def normalize_chat_url(api_base: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
+def parse_maze_responses(output: str) -> list[str]:
+    response_line = re.compile(
+        r"^\s*(?:hit wall|reached exit|moved)(?:\s*&\s*(?:hit wall|reached exit|moved))*\s*$"
+    )
+    for line in reversed(output.splitlines()):
+        if response_line.match(line):
+            return re.findall(r"hit wall|reached exit|moved", line)
+    return re.findall(r"hit wall|reached exit|moved", output)
+
+
+def add_coords(left: Coord, right: Coord) -> Coord:
+    return (left[0] + right[0], left[1] + right[1])
+
+
+def write_map_command(map_text: str) -> str:
+    return "cat > /app/maze_map.txt <<'EOF'\n" + map_text + "EOF\n"
+
+
 def normalize_model_name(model_name: str) -> str:
     return model_name.removeprefix("openai/")
 
@@ -629,6 +901,7 @@ __all__ = [
     "is_multiline_keystrokes",
     "normalize_chat_url",
     "normalize_model_name",
+    "parse_maze_responses",
     "parse_agent_decision",
     "tmux_keys_from_keystrokes",
 ]

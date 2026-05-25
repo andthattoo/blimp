@@ -9,6 +9,7 @@ from blimp.tbench_blimp_agent import (
     is_multiline_keystrokes,
     normalize_chat_url,
     normalize_model_name,
+    parse_maze_responses,
     parse_agent_decision,
     tmux_keys_from_keystrokes,
 )
@@ -68,6 +69,18 @@ Trailing text.
         self.assertEqual(
             normalize_model_name("openai/Qwen/Qwen3.5-4B"),
             "Qwen/Qwen3.5-4B",
+        )
+
+    def test_parse_maze_responses_from_terminal_output(self) -> None:
+        output = """New Terminal Output:
+
+> move N & E & S & W
+moved & hit wall & reached exit & moved
+>
+"""
+        self.assertEqual(
+            parse_maze_responses(output),
+            ["moved", "hit wall", "reached exit", "moved"],
         )
 
     def test_prompt_is_bounded_when_recent_events_are_long(self) -> None:
